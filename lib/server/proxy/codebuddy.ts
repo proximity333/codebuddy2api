@@ -829,14 +829,47 @@ const headersToRecord = (headers: HeadersInit): Record<string, string> => {
   return Object.fromEntries(new Headers(headers).entries());
 };
 
+const WORKBUDDY_DEFAULT_SYSTEM_PROMPT = 'You are a helpful assistant.';
+
+const ensureSystemFirstMessage = (
+  messages: OpenAIMessage[],
+  credentialData: CredentialData,
+): OpenAIMessage[] => {
+  const domain = String(getCredentialValue(credentialData, ['domain']) ?? '')
+    .trim()
+    .toLowerCase();
+
+  if (!domain.endsWith('workbuddy.ai')) {
+    return messages;
+  }
+
+  const firstRole = messages[0]?.role;
+
+  if (
+    messages.length === 0 ||
+    firstRole === 'system' ||
+    firstRole === 'developer'
+  ) {
+    return messages;
+  }
+
+  return [
+    { content: WORKBUDDY_DEFAULT_SYSTEM_PROMPT, role: 'system' },
+    ...messages,
+  ];
+};
+
 const buildUpstreamBody = async (
   body: ChatRequestBody,
   context: ProxyContext,
 ): Promise<ChatRequestBody> => {
-  const normalizedMessages = normalizeMessages(
-    body.messages ?? [],
-    context.preferences.firstMessageRoleToSystem,
-    context.preferences.firstSystemMessageRoleToUser,
+  const normalizedMessages = ensureSystemFirstMessage(
+    normalizeMessages(
+      body.messages ?? [],
+      context.preferences.firstMessageRoleToSystem,
+      context.preferences.firstSystemMessageRoleToUser,
+    ),
+    context.auth.credentialData,
   );
   const maxTokens = body.max_tokens ?? body.max_completion_tokens;
   const credentialModels = getCredentialSupportedModels(

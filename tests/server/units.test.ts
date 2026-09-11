@@ -1636,6 +1636,92 @@ describe('server units', () => {
     expect(text).toContain('"finish_reason":"tool_calls"');
   });
 
+  it('prepends a system message for workbuddy credentials without one', async () => {
+    const workbuddyContext = createProxyContextFromCredential({
+      data: {
+        bearer_token: 'workbuddy-token',
+        domain: 'www.workbuddy.ai',
+        user_id: 'workbuddy@example.com',
+      },
+      filePath: '/tmp/workbuddy.json',
+      filename: 'workbuddy.json',
+    });
+    const domesticContext = createProxyContextFromCredential({
+      data: {
+        bearer_token: 'domestic-token',
+        domain: 'copilot.tencent.com',
+        user_id: 'domestic@example.com',
+      },
+      filePath: '/tmp/domestic.json',
+      filename: 'domestic.json',
+    });
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () =>
+        makeJsonResponse({
+          choices: [
+            {
+              finish_reason: 'stop',
+              index: 0,
+              message: { content: 'hi', role: 'assistant' },
+            },
+          ],
+          created: 123,
+          id: 'chatcmpl-1',
+          model: 'hy3',
+          object: 'chat.completion',
+          usage: { completion_tokens: 1, prompt_tokens: 2, total_tokens: 3 },
+        }),
+      );
+    const upstreamMessages = async (
+      context: Parameters<typeof proxyChatCompletions>[2],
+      messages: Array<{ content: string; role: string }>,
+    ) => {
+      const response = await proxyChatCompletions(
+        makeNextRequest('http://localhost/v1/chat/completions', {
+          method: 'POST',
+        }),
+        { messages, model: 'hy3' },
+        context,
+      );
+      await response.text();
+      const callIndex = fetchMock.mock.calls.length - 1;
+      return {
+        messages: JSON.parse(
+          String((fetchMock.mock.calls[callIndex]?.[1] as RequestInit).body),
+        ).messages as Array<{ content: string; role: string }>,
+        url: String(fetchMock.mock.calls[callIndex]?.[0]),
+      };
+    };
+
+    const workbuddyUserFirst = await upstreamMessages(workbuddyContext, [
+      { content: 'hello', role: 'user' },
+    ]);
+    expect(workbuddyUserFirst.url).toContain('https://www.workbuddy.ai');
+    expect(workbuddyUserFirst.messages[0]?.role).toBe('system');
+    expect(workbuddyUserFirst.messages[1]).toMatchObject({
+      content: 'hello',
+      role: 'user',
+    });
+
+    const workbuddySystemFirst = await upstreamMessages(workbuddyContext, [
+      { content: 'be nice', role: 'system' },
+      { content: 'hello', role: 'user' },
+    ]);
+    expect(workbuddySystemFirst.messages).toMatchObject([
+      { content: 'be nice', role: 'system' },
+      { content: 'hello', role: 'user' },
+    ]);
+
+    const domesticUserFirst = await upstreamMessages(domesticContext, [
+      { content: 'hello', role: 'user' },
+    ]);
+    expect(domesticUserFirst.url).toContain('https://copilot.tencent.com');
+    expect(domesticUserFirst.messages).toMatchObject([
+      { content: 'hello', role: 'user' },
+    ]);
+  });
+
   it('handles empty and partial streamed custom tool inputs at EOF', async () => {
     const context = createProxyContextFromCredential({
       data: {

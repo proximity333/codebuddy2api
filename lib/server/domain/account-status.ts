@@ -1,10 +1,12 @@
-import { getCodeBuddyApiEndpoint } from './config';
 import {
   listCredentials,
   listEligibleCredentialRecords,
   type CredentialRecord,
 } from './credentials';
-import { getModelsForCredential } from '../proxy/codebuddy';
+import {
+  getApiEndpointForCredential,
+  getModelsForCredential,
+} from '../proxy/codebuddy';
 
 export interface AccountStatusSnapshot {
   checkin: { claimed: boolean | null; message: string | null };
@@ -65,9 +67,7 @@ const fetchJson = async (
   const domain = String(credential.data.domain ?? '')
     .trim()
     .toLowerCase();
-  const endpoint = domain.endsWith('workbuddy.ai')
-    ? 'https://www.workbuddy.ai'
-    : await getCodeBuddyApiEndpoint();
+  const endpoint = await getApiEndpointForCredential(credential.data);
   const origin = domain.endsWith('workbuddy.ai')
     ? 'https://www.workbuddy.ai'
     : 'https://www.codebuddy.cn';
@@ -102,8 +102,29 @@ const fetchJson = async (
     method,
     signal: AbortSignal.timeout(15_000),
   });
-  if (!response.ok) throw new Error(`${path} returned ${response.status}`);
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`${path} returned ${response.status}`, {
+      cause: { body: detail.slice(0, 500), status: response.status },
+    });
+  }
   return response.json();
+};
+
+const getUpstreamMessage = (error: unknown): string | null => {
+  const cause = (error as { cause?: { body?: unknown; status?: unknown } })
+    ?.cause;
+  if (!cause || typeof cause.body !== 'string' || !cause.body) return null;
+
+  try {
+    const payload = JSON.parse(cause.body) as {
+      code?: unknown;
+      msg?: unknown;
+    };
+    return typeof payload.msg === 'string' && payload.msg ? payload.msg : null;
+  } catch {
+    return null;
+  }
 };
 
 const fetchCheckinStatus = async (
@@ -309,13 +330,16 @@ export const checkinAccount = async (
   try {
     await fetchJson(credential, '/v2/billing/meter/daily-checkin', 'POST', {});
   } catch (error) {
+    const upstreamMessage = getUpstreamMessage(error);
     const message = error instanceof Error ? error.message : 'Check-in failed';
     return {
       ...(await loadAccountStatus(credential)),
-      error: message.replace(
-        '/v2/billing/meter/daily-checkin returned',
-        'claim returned',
-      ),
+      error:
+        upstreamMessage ??
+        message.replace(
+          '/v2/billing/meter/daily-checkin returned',
+          'claim returned',
+        ),
     };
   }
   return loadAccountStatus(credential);
