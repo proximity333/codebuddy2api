@@ -3,6 +3,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: http://10.147.20.3:7890
+        HTTPS_PROXY: http://10.147.20.3:7890
+        http_proxy: http://10.147.20.3:7890
+        https_proxy: http://10.147.20.3:7890
     image: codebuddy2api:local
     restart: unless-stopped
     ports:
