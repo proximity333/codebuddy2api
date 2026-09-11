@@ -1,20 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/lib/server/domain/config', () => ({
-  getCodeBuddyApiEndpoint: vi.fn(),
-}));
 vi.mock('@/lib/server/domain/credentials', () => ({
   listCredentials: vi.fn(),
   listEligibleCredentialRecords: vi.fn(),
 }));
 vi.mock('@/lib/server/proxy/codebuddy', () => ({
+  getApiEndpointForCredential: vi.fn(),
   getModelsForCredential: vi.fn(),
 }));
 
-const { getCodeBuddyApiEndpoint } = await import('@/lib/server/domain/config');
 const { listCredentials, listEligibleCredentialRecords } =
   await import('@/lib/server/domain/credentials');
-const { getModelsForCredential } = await import('@/lib/server/proxy/codebuddy');
+const { getApiEndpointForCredential, getModelsForCredential } =
+  await import('@/lib/server/proxy/codebuddy');
 const {
   checkinAccount,
   checkinAccounts,
@@ -36,7 +34,7 @@ const jsonResponse = (payload: unknown, status = 200) =>
 describe('account status domain', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(getCodeBuddyApiEndpoint).mockResolvedValue(
+    vi.mocked(getApiEndpointForCredential).mockResolvedValue(
       'https://codebuddy.example.test',
     );
     vi.mocked(listEligibleCredentialRecords).mockResolvedValue([
