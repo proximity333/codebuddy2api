@@ -71,6 +71,14 @@ const settingsSelectOptions: Record<
   string,
   Array<{ label: string; value: string }>
 > = {
+  CODEBUDDY_API_ENDPOINT: [
+    {
+      label: 'https://copilot.tencent.com',
+      value: 'https://copilot.tencent.com',
+    },
+    { label: 'https://www.codebuddy.ai', value: 'https://www.codebuddy.ai' },
+    { label: 'https://www.workbuddy.ai', value: 'https://www.workbuddy.ai' },
+  ],
   CODEBUDDY_AUTH_MODE: [
     { label: 'auto', value: 'auto' },
     { label: 'token', value: 'token' },
@@ -102,6 +110,12 @@ const SettingField = ({
   value: string;
 }) => {
   const selectOptions = settingsSelectOptions[settingKey];
+  const resolvedOptions =
+    selectOptions &&
+    value &&
+    !selectOptions.some((option) => option.value === value)
+      ? [...selectOptions, { label: value, value }]
+      : selectOptions;
 
   return (
     <div className="mb-4">
@@ -111,12 +125,12 @@ const SettingField = ({
       >
         {label}
       </label>
-      {selectOptions ? (
+      {resolvedOptions ? (
         <Select
           className="w-full"
           id={settingKey}
           onChange={onChange}
-          options={selectOptions}
+          options={resolvedOptions}
           value={value}
         />
       ) : (

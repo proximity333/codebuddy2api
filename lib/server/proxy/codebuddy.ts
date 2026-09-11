@@ -720,14 +720,23 @@ const getCredentialValue = (
 export const getApiEndpointForCredential = async (
   credentialData: CredentialData,
 ): Promise<string> => {
-  const domain = getCredentialValue(credentialData, ['domain']);
+  const domain = String(getCredentialValue(credentialData, ['domain']) ?? '')
+    .trim()
+    .toLowerCase();
+
+  if (domain.endsWith('workbuddy.ai')) {
+    return 'https://www.workbuddy.ai';
+  }
+
+  if (domain.endsWith('codebuddy.ai')) {
+    return 'https://www.codebuddy.ai';
+  }
 
   if (
-    String(domain ?? '')
-      .toLowerCase()
-      .endsWith('workbuddy.ai')
+    domain.endsWith('copilot.tencent.com') ||
+    domain.endsWith('codebuddy.cn')
   ) {
-    return 'https://www.workbuddy.ai';
+    return 'https://copilot.tencent.com';
   }
 
   return getCodeBuddyApiEndpoint();
