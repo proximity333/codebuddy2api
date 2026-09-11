@@ -1,0 +1,27 @@
+services:
+  codebuddy2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codebuddy2api:local
+    restart: unless-stopped
+    ports:
+      - '8001:8001'
+    environment:
+      HOSTNAME: 0.0.0.0
+      PORT: '8001'
+      NEXT_TELEMETRY_DISABLED: '1'
+      CODEBUDDY_STORAGE_BACKEND: sqlite
+      CODEBUDDY_STORAGE_ENCRYPTION_KEY: 'replace-with-a-long-random-secret'
+      CODEBUDDY_STORAGE_IMPORT_LEGACY_FILES: 'false'
+      # 国际号需要时取消注释（二选一）：
+      # CODEBUDDY_INTERNET_ENVIRONMENT: public
+      # CODEBUDDY_API_ENDPOINT: https://www.codebuddy.ai
+    volumes:
+      - .codebuddy_data:/app/.codebuddy_data
+    env_file:
+      - path: ./.env
+        required: false
+
+volumes:
+  codebuddy2api-data:

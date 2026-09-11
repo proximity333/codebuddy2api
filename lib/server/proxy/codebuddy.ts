@@ -2283,6 +2283,12 @@ export const getModelsForCredential = async ({
   const headers = new Headers({
     Accept: 'application/json',
     Authorization: `Bearer ${bearerToken}`,
+    'User-Agent': CODEBUDDY_USER_AGENT,
+    'X-IDE-Name': 'CLI',
+    'X-IDE-Type': 'CLI',
+    'X-IDE-Version': CODEBUDDY_CLI_VERSION,
+    'X-Product': 'SaaS',
+    'X-Requested-With': 'XMLHttpRequest',
   });
   const domain = getCredentialValue(credentialData, ['domain']);
   const apiEndpoint = String(domain ?? '')
