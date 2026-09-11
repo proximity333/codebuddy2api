@@ -717,11 +717,29 @@ const getCredentialValue = (
   return null;
 };
 
+export const getApiEndpointForCredential = async (
+  credentialData: CredentialData,
+): Promise<string> => {
+  const domain = getCredentialValue(credentialData, ['domain']);
+
+  if (
+    String(domain ?? '')
+      .toLowerCase()
+      .endsWith('workbuddy.ai')
+  ) {
+    return 'https://www.workbuddy.ai';
+  }
+
+  return getCodeBuddyApiEndpoint();
+};
+
 const buildUpstreamHeaders = async (
   request: NextRequest,
   auth: ResolvedAuth,
 ): Promise<HeadersInit> => {
-  const baseUrl = new URL(await getCodeBuddyApiEndpoint());
+  const baseUrl = new URL(
+    await getApiEndpointForCredential(auth.credentialData),
+  );
   const incoming = getRequestHeaderMap(request.headers);
   const requestId =
     incoming['x-request-id'] ?? crypto.randomUUID().replaceAll('-', '');
@@ -2279,7 +2297,6 @@ export const getModelsForCredential = async ({
   bearerToken: string;
   credentialData: CredentialData;
 }): Promise<DiscoveredModel[]> => {
-  const configuredEndpoint = await getCodeBuddyApiEndpoint();
   const headers = new Headers({
     Accept: 'application/json',
     Authorization: `Bearer ${bearerToken}`,
@@ -2291,11 +2308,7 @@ export const getModelsForCredential = async ({
     'X-Requested-With': 'XMLHttpRequest',
   });
   const domain = getCredentialValue(credentialData, ['domain']);
-  const apiEndpoint = String(domain ?? '')
-    .toLowerCase()
-    .endsWith('workbuddy.ai')
-    ? 'https://www.workbuddy.ai'
-    : configuredEndpoint;
+  const apiEndpoint = await getApiEndpointForCredential(credentialData);
   const enterpriseId = getCredentialValue(credentialData, [
     'enterprise_id',
     'enterpriseId',
@@ -2527,7 +2540,9 @@ export const proxyChatCompletions = async (
           `Unsupported Chat options for Responses upstream: ${unsupportedOptions.join(', ')}`,
         );
       }
-      const apiEndpoint = await getCodeBuddyApiEndpoint();
+      const apiEndpoint = await getApiEndpointForCredential(
+        resolvedContext.auth.credentialData,
+      );
       const upstreamUrl = `${apiEndpoint}/responses`;
       const upstreamHeaders = new Headers(
         await buildUpstreamHeaders(request, resolvedContext.auth),
@@ -2615,7 +2630,9 @@ export const proxyChatCompletions = async (
       );
     }
 
-    const apiEndpoint = await getCodeBuddyApiEndpoint();
+    const apiEndpoint = await getApiEndpointForCredential(
+      resolvedContext.auth.credentialData,
+    );
     const upstreamUrl = `${apiEndpoint}/v2/chat/completions`;
     const upstreamHeaders = await buildUpstreamHeaders(
       request,
@@ -2742,7 +2759,9 @@ export const proxyResponsesUpstream = async (
           ? body.model
           : await getDefaultModel(),
     };
-    const apiEndpoint = await getCodeBuddyApiEndpoint();
+    const apiEndpoint = await getApiEndpointForCredential(
+      resolvedContext.auth.credentialData,
+    );
     const upstreamUrl = `${apiEndpoint}/responses`;
     const upstreamHeaders = new Headers(
       await buildUpstreamHeaders(request, resolvedContext.auth),

@@ -1,5 +1,6 @@
 services:
   codebuddy2api:
+    container_name: codebuddy2api
     build:
       context: .
       dockerfile: Dockerfile
