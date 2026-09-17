@@ -211,24 +211,40 @@ const AutoCheckinRow = ({
   return (
     <Flexbox
       align="center"
-      className="account-status-card-auto-checkin"
+      className="account-status-card-auto-checkin account-status-card-auto-checkin-nowrap"
       distribution="space-between"
       gap={12}
       horizontal
-      wrap="wrap"
       width="100%"
     >
-      <Flexbox align="center" gap={8} horizontal>
+      <Flexbox
+        align="center"
+        className="account-status-card-auto-checkin-info"
+        gap={8}
+        horizontal
+      >
         <CalendarClock size={16} />
         <Flexbox direction="vertical" gap={2}>
-          <Text strong>{text('accountStatus.autoCheckin')}</Text>
+          <Text strong className="account-status-card-auto-checkin-title">
+            {text('accountStatus.autoCheckin')}
+          </Text>
           <Text className="text-sm" type="secondary">
             {text('accountStatus.autoCheckinDescription')}
           </Text>
         </Flexbox>
       </Flexbox>
-      <Flexbox align="center" gap={12} horizontal>
-        <Text type="secondary">{text('accountStatus.autoCheckinTime')}</Text>
+      <Flexbox
+        align="center"
+        className="account-status-card-auto-checkin-controls"
+        gap={12}
+        horizontal
+      >
+        <Text
+          className="account-status-card-auto-checkin-time-label"
+          type="secondary"
+        >
+          {text('accountStatus.autoCheckinTime')}
+        </Text>
         <Select
           className="account-status-card-auto-checkin-time"
           disabled={!enabled || saving}

@@ -355,8 +355,31 @@ textarea {
 }
 
 .account-status-card-header,
-.account-status-card-checkin {
+.account-status-card-checkin,
+.account-status-card-auto-checkin {
   min-width: 0;
+}
+
+.account-status-card-auto-checkin-nowrap {
+  flex-wrap: nowrap;
+}
+
+.account-status-card-auto-checkin-info {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.account-status-card-auto-checkin-title {
+  white-space: nowrap;
+}
+
+.account-status-card-auto-checkin-controls {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
+.account-status-card-auto-checkin-time-label {
+  white-space: nowrap;
 }
 
 .account-status-card-identity {
@@ -385,7 +408,8 @@ textarea {
   }
 
   .account-status-card-header,
-  .account-status-card-checkin {
+  .account-status-card-checkin,
+  .account-status-card-auto-checkin-nowrap {
     align-items: flex-start !important;
     flex-direction: column !important;
     gap: 8px !important;
