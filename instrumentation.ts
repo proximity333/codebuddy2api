@@ -3,9 +3,12 @@ export const register = async (): Promise<void> => {
 
   const { refreshMissingCredentialModels } =
     await import('@/lib/server/domain/credential-models');
-  const { startCheckinScheduler } =
-    await import('@/lib/server/domain/checkin-scheduler');
+  const { startAutoCheckinScheduler } =
+    await import('@/lib/server/domain/auto-checkin-scheduler');
 
   void refreshMissingCredentialModels();
-  startCheckinScheduler();
+
+  // Only in the server process: a build or an edge runtime must not start a
+  // timer that would outlive the request it belongs to.
+  startAutoCheckinScheduler();
 };

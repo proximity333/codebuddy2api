@@ -57,9 +57,14 @@ import {
   resetResponseSessions,
   translateResponsesToolsToChat,
 } from '@/lib/server/proxy/responses';
+import { handleMessagesRequest } from '@/lib/server/proxy/anthropic';
 import {
   getActiveConfig,
+  getApiFirstDeltaTimeoutMs,
   getDefaultModel,
+  getHyThoughtDepthEnabled,
+  getSettingLabels,
+  isHyModel,
   updateSettings,
 } from '@/lib/server/domain/config';
 import { getRequestHeaderMap } from '@/lib/server/shared/http';
@@ -109,6 +114,25 @@ const makeJsonResponse = (
       'Content-Type': 'application/json',
     },
   });
+};
+
+/** A minimal non-streaming Chat Completions response, for the /v1/messages path. */
+const chatCompletionPayload = (model: string): Record<string, unknown> => {
+  return {
+    choices: [{ message: { content: 'ok', role: 'assistant' } }],
+    model,
+    usage: { completion_tokens: 1, prompt_tokens: 1, total_tokens: 2 },
+  };
+};
+
+/** A minimal non-streaming Responses payload, for the /v1/responses path. */
+const responsesPayload = (model: string): Record<string, unknown> => {
+  return {
+    model,
+    output: [
+      { content: [{ text: 'ok', type: 'output_text' }], type: 'message' },
+    ],
+  };
 };
 
 const waitForAsync = async (
@@ -1943,6 +1967,153 @@ describe('server units', () => {
       text: { format: { type: 'json_object' } },
       tool_choice: 'auto',
     });
+  });
+
+  it('converts Claude Code thinking onto the Hy reasoning_effort', async () => {
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: true });
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(makeJsonResponse(chatCompletionPayload('hy3')));
+
+    const response = await handleMessagesRequest(
+      makeNextRequest('http://localhost/v1/messages', { method: 'POST' }),
+      {
+        max_tokens: 16_000,
+        messages: [{ content: 'think hard', role: 'user' }],
+        model: 'hy3',
+        thinking: { budget_tokens: 16_000, type: 'enabled' },
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    ) as Record<string, unknown>;
+
+    // Claude Code speaks Anthropic budget_tokens; upstream wants a named level.
+    expect(body.reasoning_effort).toBe('high');
+  });
+
+  it('drops the Anthropic thinking block once it has been translated', async () => {
+    // Leaving the original block alongside the converted effort would still be
+    // rejected by the upstream this translation exists to satisfy.
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: true });
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(makeJsonResponse(chatCompletionPayload('hy3')));
+
+    await handleMessagesRequest(
+      makeNextRequest('http://localhost/v1/messages', { method: 'POST' }),
+      {
+        max_tokens: 16_000,
+        messages: [{ content: 'think hard', role: 'user' }],
+        model: 'hy3',
+        thinking: { budget_tokens: 16_000, type: 'enabled' },
+      },
+    );
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    ) as Record<string, unknown>;
+
+    expect(body.reasoning_effort).toBe('high');
+    expect(body).not.toHaveProperty('thinking');
+  });
+
+  it('converts Codex reasoning.effort onto the Hy vocabulary', async () => {
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: true });
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(makeJsonResponse(responsesPayload('hy3')));
+
+    await proxyResponsesUpstream(
+      makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+      {
+        input: 'reason about this',
+        model: 'hy3',
+        reasoning: { effort: 'medium', summary: 'auto' },
+      },
+    );
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    ) as Record<string, unknown>;
+
+    // `medium` is not a Hy level, so it collapses onto the nearest one.
+    expect(body.reasoning).toEqual({ effort: 'low', summary: 'auto' });
+  });
+
+  it('forwards Codex reasoning untouched when Hy conversion is off', async () => {
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: false });
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(makeJsonResponse(chatCompletionPayload('hy3')));
+
+    await proxyResponsesUpstream(
+      makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+      { input: 'keep as is', model: 'hy3', reasoning: { effort: 'medium' } },
+    );
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    ) as Record<string, unknown>;
+
+    expect(body.reasoning).toEqual({ effort: 'medium' });
+  });
+
+  it('keeps the Anthropic thinking block when conversion is off', async () => {
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: false });
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(makeJsonResponse(chatCompletionPayload('hy3')));
+
+    await handleMessagesRequest(
+      makeNextRequest('http://localhost/v1/messages', { method: 'POST' }),
+      {
+        max_tokens: 16_000,
+        messages: [{ content: 'think hard', role: 'user' }],
+        model: 'hy3',
+        thinking: { budget_tokens: 16_000, type: 'enabled' },
+      },
+    );
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    ) as Record<string, unknown>;
+
+    expect(body.thinking).toEqual({
+      budget_tokens: 16_000,
+      type: 'enabled',
+    });
+    expect(body).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('leaves non-Hy models untouched when conversion is on', async () => {
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: true });
+
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(makeJsonResponse(responsesPayload('hy3')));
+
+    await proxyResponsesUpstream(
+      makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+      {
+        input: 'no conversion',
+        model: 'glm-5.1',
+        reasoning: { effort: 'medium' },
+      },
+    );
+
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    ) as Record<string, unknown>;
+
+    expect(body.reasoning).toEqual({ effort: 'medium' });
   });
 
   it('covers Responses payload fallback and stop variants', async () => {
@@ -4390,6 +4561,46 @@ describe('server units', () => {
     expect(responseState.__codebuddy2apiResponseSessionTotalBytes__).toBe(0);
   });
 
+  it('breaks out of pruning when the byte total drifts ahead of an empty store', async () => {
+    const responseState = globalThis as typeof globalThis & {
+      __codebuddy2apiResponseSessionBytes__?: Map<string, number>;
+      __codebuddy2apiResponseSessionTotalBytes__?: number;
+      __codebuddy2apiResponseSessions__?: Map<string, { createdAt: number }>;
+    };
+    resetResponseSessions();
+
+    // Simulate a total that has drifted out of step with the map: the loop
+    // would otherwise find no oldest id to remove and spin forever, blocking
+    // the event loop.
+    // Far larger than any single session, so a leftover is unmistakable.
+    const driftedBytes = 100 * 1024 * 1024;
+    responseState.__codebuddy2apiResponseSessionTotalBytes__ = driftedBytes;
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      makeJsonResponse({
+        choices: [{ message: { content: 'after drifted total' } }],
+        model: 'gpt-5.5',
+      }),
+    );
+
+    const response = await handleResponsesRequest(
+      makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+      { input: 'drifted total', model: 'gpt-5.5' },
+    );
+
+    // Getting a response at all proves the loop broke out instead of spinning
+    // forever on an empty store with a positive total.
+    expect(response.status).toBe(200);
+    expect((await response.json()).output_text).toBe('after drifted total');
+
+    // The drifted total was cleared; only this request's session remains.
+    expect(
+      responseState.__codebuddy2apiResponseSessionTotalBytes__,
+    ).toBeLessThan(driftedBytes);
+
+    resetResponseSessions();
+  });
+
   it('updates saved credentials by index and normalizes string boolean flags', async () => {
     const createdCredential = await addCredential({
       bearer_token: 'token-original',
@@ -5145,15 +5356,21 @@ describe('server units', () => {
       },
     ]);
 
-    expect(result).toHaveLength(6);
-    expect(result?.[0]).toEqual({
+    expect(result).toHaveLength(7);
+    expect(result?.[0]).toMatchObject({
+      type: 'function',
+      function: {
+        name: 'web_search',
+      },
+    });
+    expect(result?.[1]).toEqual({
       type: 'function',
       function: {
         name: 'lookup_weather',
         parameters: { type: 'object', properties: {} },
       },
     });
-    expect(result?.[1]).toEqual({
+    expect(result?.[2]).toEqual({
       type: 'function',
       function: {
         name: 'search_files',
@@ -5163,17 +5380,13 @@ describe('server units', () => {
         },
       },
     });
-    expect(result?.[2]).toEqual({
+    expect(result?.[3]).toMatchObject({
       type: 'function',
       function: {
-        name: 'search_web',
-        parameters: {
-          type: 'object',
-          properties: { query: { type: 'string' } },
-        },
+        name: 'web_search',
       },
     });
-    expect(result?.[3]).toEqual({
+    expect(result?.[4]).toEqual({
       type: 'function',
       function: {
         name: 'svc__mcp_tool',
@@ -5184,7 +5397,7 @@ describe('server units', () => {
         },
       },
     });
-    expect(result?.[4]).toEqual({
+    expect(result?.[5]).toEqual({
       type: 'function',
       function: {
         name: 'docs__lookup',
@@ -5195,7 +5408,7 @@ describe('server units', () => {
         },
       },
     });
-    expect(result?.[5]).toEqual({
+    expect(result?.[6]).toEqual({
       type: 'function',
       function: {
         name: 'tool_search',
@@ -5604,6 +5817,602 @@ describe('server units', () => {
     await expect(getActiveConfig()).resolves.toMatchObject({
       CODEBUDDY_ADMIN_PASSKEY_RP_ID: 'admin.example.com',
       CODEBUDDY_AUTH_MODE: 'token',
+    });
+  });
+
+  it('defaults Hy thought depth conversion to off', async () => {
+    await updateSettings({});
+
+    await expect(getActiveConfig()).resolves.toMatchObject({
+      CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: false,
+    });
+    await expect(getHyThoughtDepthEnabled()).resolves.toBe(false);
+  });
+
+  it('turns Hy thought depth conversion on from the console', async () => {
+    await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: true });
+
+    await expect(getHyThoughtDepthEnabled()).resolves.toBe(true);
+  });
+
+  it('accepts the truthy spellings a boolean setting arrives in', async () => {
+    // The console switch sends a real boolean, but the value can also arrive as
+    // "1"/"true" from the environment, so both have to enable it.
+    for (const value of [true, 'true', '1', 'TRUE']) {
+      await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: value });
+
+      await expect(getHyThoughtDepthEnabled()).resolves.toBe(true);
+    }
+  });
+
+  it('treats an unrecognized Hy thought depth as off', async () => {
+    // A garbage value must not silently rewrite thinking depth for every Hy
+    // request, so the conservative reading wins.
+    for (const value of ['yes', 'maybe', '2', '']) {
+      await updateSettings({ CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED: value });
+
+      await expect(getHyThoughtDepthEnabled()).resolves.toBe(false);
+    }
+  });
+
+  it('reads Hy thought depth from the environment', async () => {
+    // beforeEach wipes the persisted config, so the env value is the only
+    // thing that can be in play here.
+    process.env.CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED = '1';
+
+    try {
+      await expect(getHyThoughtDepthEnabled()).resolves.toBe(true);
+    } finally {
+      delete process.env.CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED;
+    }
+  });
+
+  it('treats any hy-prefixed model as a Hy model', () => {
+    // The upstream decides which ids exist, so matching is a prefix test rather
+    // than a list of known ids: a new hy release is covered without a code change.
+    expect(isHyModel('hy3')).toBe(true);
+    expect(isHyModel('hy3-ioa')).toBe(true);
+    expect(isHyModel('hy3-preview-agent-ioa')).toBe(true);
+    expect(isHyModel('hy2')).toBe(true);
+    expect(isHyModel('hy')).toBe(true);
+    expect(isHyModel('  hy4-future  ')).toBe(true);
+  });
+
+  it('recognizes Hy models case-insensitively', () => {
+    expect(isHyModel('HY3-IOA')).toBe(true);
+    expect(isHyModel('Hy3')).toBe(true);
+  });
+
+  it('does not treat other model families as Hy models', () => {
+    // hunyuan-* is a different prefix, so it must not be matched.
+    expect(isHyModel('hunyuan-2.0-thinking')).toBe(false);
+    expect(isHyModel('hunyuan-chat')).toBe(false);
+    expect(isHyModel('glm-5.1')).toBe(false);
+    expect(isHyModel(undefined)).toBe(false);
+    expect(isHyModel('')).toBe(false);
+  });
+
+  it('labels Hy thought depth in every supported locale', () => {
+    expect(
+      getSettingLabels('en-US').CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED,
+    ).toBeTruthy();
+    expect(
+      getSettingLabels('ja-JP').CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED,
+    ).toBeTruthy();
+    expect(
+      getSettingLabels('zh-CN').CODEBUDDY_HY_THOUGHT_DEPTH_ENABLED,
+    ).toBeTruthy();
+  });
+
+  it('defaults the API timeout to five minutes', async () => {
+    await updateSettings({});
+
+    await expect(getActiveConfig()).resolves.toMatchObject({
+      CODEBUDDY_API_TIMEOUT_MINUTES: 5,
+    });
+  });
+
+  it('converts the API timeout from minutes to milliseconds', async () => {
+    await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 2 });
+
+    await expect(getApiFirstDeltaTimeoutMs()).resolves.toBe(120_000);
+  });
+
+  it('parses a numeric API timeout supplied as a string', async () => {
+    // The console submits every field as text, so a number that arrives as a
+    // string still has to become a number rather than being stringified.
+    await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: '1.5' });
+
+    const config = await getActiveConfig();
+
+    expect(config.CODEBUDDY_API_TIMEOUT_MINUTES).toBe(1.5);
+  });
+
+  it('clamps an out-of-range API timeout instead of storing it', async () => {
+    await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 10_000 });
+
+    await expect(getActiveConfig()).resolves.toMatchObject({
+      CODEBUDDY_API_TIMEOUT_MINUTES: 1440,
+    });
+
+    await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0 });
+
+    await expect(getActiveConfig()).resolves.toMatchObject({
+      CODEBUDDY_API_TIMEOUT_MINUTES: 0.1,
+    });
+  });
+
+  it('falls back to the default for a non-numeric API timeout', async () => {
+    // A NaN timeout would silently disable the deadline, so it has to fall back.
+    await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 'soon' });
+
+    await expect(getActiveConfig()).resolves.toMatchObject({
+      CODEBUDDY_API_TIMEOUT_MINUTES: 5,
+    });
+  });
+
+  it('reads the API timeout from the environment', async () => {
+    // beforeEach wipes the persisted config, so the env value is the only
+    // thing that can be in play here.
+    process.env.CODEBUDDY_API_TIMEOUT_MINUTES = '3';
+
+    try {
+      await expect(getActiveConfig()).resolves.toMatchObject({
+        CODEBUDDY_API_TIMEOUT_MINUTES: 3,
+      });
+    } finally {
+      delete process.env.CODEBUDDY_API_TIMEOUT_MINUTES;
+    }
+  });
+
+  it('keeps coercing non-numeric settings to strings', async () => {
+    await updateSettings({ CODEBUDDY_LOG_LEVEL: true });
+
+    await expect(getActiveConfig()).resolves.toMatchObject({
+      CODEBUDDY_LOG_LEVEL: 'true',
+    });
+  });
+
+  it('labels the API timeout in every supported locale', () => {
+    expect(
+      getSettingLabels('en-US').CODEBUDDY_API_TIMEOUT_MINUTES,
+    ).toBeTruthy();
+    expect(
+      getSettingLabels('ja-JP').CODEBUDDY_API_TIMEOUT_MINUTES,
+    ).toBeTruthy();
+    expect(
+      getSettingLabels('zh-CN').CODEBUDDY_API_TIMEOUT_MINUTES,
+    ).toBeTruthy();
+  });
+
+  describe('API timeout enforcement', () => {
+    const context = createProxyContextFromCredential({
+      data: {
+        bearer_token: 'timeout-token',
+        user_id: 'timeout@example.com',
+      },
+      filePath: '/tmp/timeout.json',
+      filename: 'timeout.json',
+    });
+
+    const chatRequest = () =>
+      makeNextRequest('http://localhost/v1/chat/completions', {
+        method: 'POST',
+      });
+
+    /** An upstream that never settles, so the deadline is what ends the wait. */
+    const hangUntilAborted = () =>
+      vi.spyOn(globalThis, 'fetch').mockImplementation(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(init.signal?.reason);
+            });
+          }),
+      );
+
+    it('aborts a chat request that produces no response in time', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      hangUntilAborted();
+
+      const response = await proxyChatCompletions(
+        chatRequest(),
+        {
+          messages: [{ content: 'Take forever', role: 'user' }],
+          model: 'glm-5.1',
+        },
+        context,
+      );
+
+      expect(response.status).toBe(504);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { message: 'Upstream CodeBuddy request timed out' },
+      });
+    });
+
+    it('fails a stalled stream with an OpenAI error chunk', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      // Headers arrive immediately, but the body only sends keepalives, so the
+      // first delta never comes and the streaming deadline has to fire.
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await proxyChatCompletions(
+        chatRequest(),
+        {
+          messages: [{ content: 'Stall', role: 'user' }],
+          model: 'glm-5.1',
+          stream: true,
+        },
+        context,
+      );
+
+      const text = await response.text();
+
+      expect(text).toContain('"error"');
+      expect(text).toContain('did not produce output');
+      expect(text).toContain('data: [DONE]');
+    });
+
+    it('surfaces the timeout as an Anthropic error event', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      // Headers arrive, then nothing: the Messages route must report the
+      // timeout through its own protocol rather than a bare transport error.
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await handleMessagesRequest(
+        makeNextRequest('http://localhost/v1/messages', { method: 'POST' }),
+        {
+          max_tokens: 16,
+          messages: [{ content: 'Stall', role: 'user' }],
+          model: 'glm-5.1',
+          stream: true,
+        },
+      );
+
+      const text = await response.text();
+
+      expect(text).toContain('event: error');
+      expect(text).toContain('"type":"api_error"');
+    });
+
+    it('surfaces the timeout as a Responses error event', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await handleResponsesRequest(
+        makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+        {
+          input: 'Stall',
+          model: 'glm-5.1',
+          stream: true,
+        },
+      );
+
+      const text = await response.text();
+
+      expect(text).toContain('event: response.error');
+      expect(text).toContain('did not produce output');
+    });
+
+    it('stays silent when the client cancels during a stalled stream', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      let upstreamCancelled = false;
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+            cancel() {
+              upstreamCancelled = true;
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await proxyChatCompletions(
+        chatRequest(),
+        {
+          messages: [{ content: 'Stall', role: 'user' }],
+          model: 'glm-5.1',
+          stream: true,
+        },
+        context,
+      );
+
+      // Cancelling first means the pump must not report a timeout at all.
+      await response.body?.cancel('client disconnected');
+
+      expect(upstreamCancelled).toBe(true);
+    });
+
+    it('propagates a non-timeout stream failure through the Anthropic route', async () => {
+      // A reader that rejects with something other than a timeout must fall
+      // through to the generic error path rather than being reshaped.
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+            pull() {
+              throw new Error('socket exploded');
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await handleMessagesRequest(
+        makeNextRequest('http://localhost/v1/messages', { method: 'POST' }),
+        {
+          max_tokens: 16,
+          messages: [{ content: 'Break', role: 'user' }],
+          model: 'glm-5.1',
+          stream: true,
+        },
+      );
+
+      // A non-timeout failure stays a transport error instead of being
+      // reshaped into the protocol's timeout event.
+      await expect(response.text()).rejects.toThrow('socket exploded');
+    });
+
+    it('propagates a non-timeout stream failure through the Responses route', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+            pull() {
+              throw new Error('socket exploded');
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await handleResponsesRequest(
+        makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+        { input: 'Break', model: 'glm-5.1', stream: true },
+      );
+
+      await expect(response.text()).rejects.toThrow('socket exploded');
+    });
+
+    it('stays silent when a native Responses stream is cancelled while stalled', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      // A native Responses upstream (not the chat pipeline) exercises the
+      // pass-through stream, which has its own cancellation path.
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await proxyResponsesUpstream(
+        chatRequest(),
+        { input: 'Stall', model: 'glm-5.1', stream: true },
+        context,
+      );
+
+      const reader = response.body?.getReader();
+      // Read once so the pump is mid-flight, then cancel: the pending read
+      // rejects and the pump's catch sees `cancelled` already set.
+      await reader?.read();
+      await reader?.cancel('client disconnected');
+
+      expect(response.status).toBe(200);
+    });
+
+    it('stays silent when an Anthropic stream is cancelled while stalled', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      // The upstream stalls after the first keepalive, so the pump is blocked
+      // on a read when the client goes away.
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await handleMessagesRequest(
+        makeNextRequest('http://localhost/v1/messages', { method: 'POST' }),
+        {
+          max_tokens: 16,
+          messages: [{ content: 'Stall', role: 'user' }],
+          model: 'glm-5.1',
+          stream: true,
+        },
+      );
+
+      const anReader = response.body?.getReader();
+      await anReader?.read();
+      // The deadline is still pending, so cancelling now makes the pump's
+      // catch observe `cancelled` before it can reshape anything.
+      await anReader?.cancel('client disconnected');
+
+      expect(response.status).toBe(200);
+    });
+
+    it('stays silent when a Responses stream is cancelled while stalled', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(': ping\n\n'));
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await handleResponsesRequest(
+        makeNextRequest('http://localhost/v1/responses', { method: 'POST' }),
+        { input: 'Stall', model: 'glm-5.1', stream: true },
+      );
+
+      // Cancelling first means no timeout should be reported downstream.
+      await response.body?.cancel('client disconnected');
+
+      expect(response.status).toBe(200);
+    });
+
+    it('returns a 504 when the Responses upstream never answers', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      hangUntilAborted();
+
+      const response = await proxyResponsesUpstream(
+        chatRequest(),
+        { input: 'Take forever', model: 'glm-5.1' },
+        context,
+      );
+
+      expect(response.status).toBe(504);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { message: 'Upstream CodeBuddy request timed out' },
+      });
+    });
+
+    it('returns a 504 for the Responses upstream behind the chat route', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      hangUntilAborted();
+
+      const response = await proxyChatCompletions(
+        chatRequest(),
+        {
+          messages: [{ content: 'Take forever', role: 'user' }],
+          model: 'glm-5.1',
+        },
+        createProxyContextFromCredential({
+          data: {
+            bearer_token: 'responses-token',
+            upstream_protocol: 'responses',
+            user_id: 'responses@example.com',
+          },
+          filePath: '/tmp/responses.json',
+          filename: 'responses.json',
+        }),
+      );
+
+      expect(response.status).toBe(504);
+    });
+
+    it('reports a non-Error upstream failure through the Responses route', async () => {
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce('boom');
+
+      const response = await proxyResponsesUpstream(
+        chatRequest(),
+        { model: 'glm-5.1' },
+        context,
+      );
+
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { message: 'Unexpected upstream error' },
+      });
+    });
+
+    it('falls back to a generic message when an upstream failure is not an Error', async () => {
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce('boom');
+
+      const response = await proxyChatCompletions(
+        chatRequest(),
+        {
+          messages: [{ content: 'Explode', role: 'user' }],
+          model: 'glm-5.1',
+        },
+        context,
+      );
+
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { message: 'Unexpected upstream error' },
+      });
+    });
+
+    it('lets a stream that produced a first delta continue past the deadline', async () => {
+      await updateSettings({ CODEBUDDY_API_TIMEOUT_MINUTES: 0.1 });
+      // A delta arrives up front, so the long tail that follows must not be cut
+      // off even though it takes far longer than the configured window.
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            async start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                ),
+              );
+              await new Promise((resolve) => setTimeout(resolve, 400));
+              controller.enqueue(
+                new TextEncoder().encode(
+                  'data: {"choices":[{"delta":{"content":" there"}}]}\n\n',
+                ),
+              );
+              controller.close();
+            },
+          }),
+          { headers: { 'Content-Type': 'text/event-stream' } },
+        ),
+      );
+
+      const response = await proxyChatCompletions(
+        chatRequest(),
+        {
+          messages: [{ content: 'Stream then lag', role: 'user' }],
+          model: 'glm-5.1',
+          stream: true,
+        },
+        context,
+      );
+
+      const text = await response.text();
+
+      // The deadline is 6s of wall time scaled to 0.1 minutes = 6s, but the
+      // point is that the second chunk lands despite the delay.
+      expect(text).toContain('"hi"');
+      expect(text).toContain('" there"');
+      expect(text).not.toContain('timed out');
     });
   });
 });

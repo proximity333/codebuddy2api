@@ -52,7 +52,12 @@
       "checkinAll": "Check in all",
       "empty": "No credentials",
       "quotaUnknown": "Unknown quota",
-      "quotaUsed": "{percent}% quota remaining"
+      "quotaUsed": "{percent}% quota remaining",
+      "autoCheckin": "Automatic check-in",
+      "autoCheckinDescription": "Check this account in once a day at the chosen time, while the gateway is running.",
+      "autoCheckinTime": "Time",
+      "autoCheckinSaved": "Automatic check-in saved",
+      "autoCheckinFailed": "Could not save automatic check-in"
     },
     "dashboard": {
       "welcomeTitle": "Ready to crank through some tokens?",
@@ -437,6 +442,8 @@
       "loginDescription": "Use the built-in admin login to establish the session cookie, then manage credentials, access keys, and passkeys from the console."
     },
     "settingsPanel": {
+      "apiTimeoutHint": "Measured from when a request is sent until the upstream produces its first delta. Once output has started, a long answer is allowed to finish. Accepts fractional minutes, from 0.1 to 1440.",
+      "hyThoughtDepthHint": "Converts downstream thinking parameters into the upstream reasoning_effort for Hy models. Claude Code's thinking and Codex's reasoning.effort both map onto no_think / low / high. Defaults to off, which forwards requests unchanged.",
       "clearUsageEvents": "Clear usage event cache",
       "confirmClearUsageEvents": "Clear all stored usage events?",
       "helper": "The passkey RP ID should usually match the final site domain. HTTPS works directly; localhost is commonly allowed for local development, while other non-HTTPS domains usually cannot use passkeys.",
@@ -444,6 +451,8 @@
       "passkeyRpIdPlaceholder": "Leave empty to follow the current host",
       "saveSuccess": "Settings saved.",
       "title": "Service settings",
+      "webSearchBackendHint": "Where web search runs. codebuddy calls CodeBuddy's own agent-tool endpoint using a saved credential; searxng queries a SearXNG instance (configure SEARXNG_URL); none turns the tool off.",
+      "webFetchBackendHint": "Where web fetch runs. codebuddy calls CodeBuddy's own agent-tool endpoint using a saved credential, falling back to a direct fetch if it fails; local fetches the page from this server; none turns the tool off.",
       "usageCacheDescription": "Remove all stored usage events. This cannot be undone.",
       "usageCacheTitle": "Usage event cache"
     },

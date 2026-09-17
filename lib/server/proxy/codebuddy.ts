@@ -1,7 +1,11 @@
 import type { NextRequest } from 'next/server';
 
 import { resolveRequestAccessKey } from './auth';
-import { getCodeBuddyApiEndpoint, getDefaultModel } from '../domain/config';
+import {
+  getApiFirstDeltaTimeoutMs,
+  getCodeBuddyApiEndpoint,
+  getDefaultModel,
+} from '../domain/config';
 import {
   type CredentialData,
   type CredentialRecord,
@@ -20,6 +24,31 @@ import {
   type DebugTrace,
 } from '../domain/debug';
 import { createErrorResponse, getRequestHeaderMap } from '../shared/http';
+import {
+  resolveHyChatThinking,
+  resolveHyResponsesReasoning,
+} from '../shared/hy-thought-depth';
+import { withCodeBuddyToken } from '../search/token';
+import {
+  normalizeToolName,
+  WEB_FETCH_TOOL_NAME,
+  WEB_SEARCH_TOOL_NAME,
+} from '../search/tool';
+import {
+  attachServerToolExecutions,
+  type ChatCompletionPayload,
+  executeWebSearchLoop,
+  type ServerToolCallbacks,
+  synthesizeChatCompletionStream,
+} from './web-search-loop';
+import {
+  chatStreamErrorChunks,
+  createStreamCloser,
+  fetchWithDeadline,
+  responsesStreamErrorChunks,
+  readTimeoutFrame,
+  toUpstreamTimeoutMessage,
+} from '../shared/upstream-timeout';
 import { recordUsageEvent, type UsageSnapshot } from '../domain/usage';
 
 interface OpenAIMessage {
@@ -293,6 +322,7 @@ const trackResponsesUsageStream = async ({
   const encoder = new TextEncoder();
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let cancelled = false;
+  const closer = createStreamCloser();
   let latestUsage = fallbackUsage;
   let responseBinding: Promise<void> | null = null;
   let usageRecorded = false;
@@ -371,12 +401,14 @@ const trackResponsesUsageStream = async ({
           if (done) {
             if (buffer) {
               await inspectFrame(buffer);
+              if (closer.closed) return;
               controller.enqueue(encoder.encode(buffer));
             }
 
             await recordStreamUsage();
             await responseBinding;
             releaseReader();
+            closer.mark();
             controller.close();
             return;
           }
@@ -409,11 +441,21 @@ const trackResponsesUsageStream = async ({
         await responseBinding;
         await recordStreamUsage();
         releaseReader();
+        const timeoutMessage = toUpstreamTimeoutMessage(error);
+
+        if (timeoutMessage !== null) {
+          // Frames here are forwarded verbatim, so the error has to arrive as
+          // the Responses protocol's own event.
+          closer.fail(controller, responsesStreamErrorChunks(timeoutMessage));
+          return;
+        }
+
         controller.error(error);
       });
     },
     async cancel(reason): Promise<void> {
       cancelled = true;
+      closer.mark();
       try {
         await reader?.cancel(reason);
       } finally {
@@ -880,6 +922,8 @@ const buildUpstreamBody = async (
       ? body.model
       : (credentialModels[0] ?? (await getDefaultModel()));
 
+  const hyThinking = await resolveHyChatThinking(model, body);
+
   return {
     model,
     messages: normalizedMessages,
@@ -896,8 +940,8 @@ const buildUpstreamBody = async (
     tools: body.tools,
     tool_choice: body.tool_choice,
     parallel_tool_calls: body.parallel_tool_calls,
-    thinking: body.thinking,
-    reasoning_effort: body.reasoning_effort,
+    thinking: hyThinking.thinking,
+    reasoning_effort: hyThinking.reasoningEffort,
   };
 };
 
@@ -1081,13 +1125,29 @@ const getPendingStopPrefixLength = (
   return 0;
 };
 
-const normalizeResponsesUpstreamBody = (
+/**
+ * Codex sends `reasoning.effort` in the OpenAI vocabulary, which Hy models do
+ * not accept, so the effort is rewritten onto the Hy vocabulary before the body
+ * is forwarded.
+ */
+const resolveHyResponsesBody = async (
   body: Record<string, unknown>,
-): Record<string, unknown> => {
+): Promise<Record<string, unknown>> => {
+  const reasoning = await resolveHyResponsesReasoning(
+    typeof body.model === 'string' ? body.model : undefined,
+    body.reasoning as Record<string, unknown> | undefined,
+  );
+
+  return { ...body, reasoning };
+};
+
+const normalizeResponsesUpstreamBody = async (
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> => {
   const { messages, ...rest } = body;
 
   if (rest.input !== undefined || !Array.isArray(messages)) {
-    return rest;
+    return resolveHyResponsesBody(rest);
   }
 
   const systemInstructions = messages
@@ -1125,12 +1185,16 @@ const normalizeResponsesUpstreamBody = (
     .filter(Boolean)
     .join('\n\n');
 
-  return { ...rest, ...(instructions ? { instructions } : {}), input };
+  return resolveHyResponsesBody({
+    ...rest,
+    ...(instructions ? { instructions } : {}),
+    input,
+  });
 };
 
-const buildResponsesBodyFromChat = (
+const buildResponsesBodyFromChat = async (
   body: ChatRequestBody,
-): Record<string, unknown> => {
+): Promise<Record<string, unknown>> => {
   const instructions = body.messages
     ?.filter(
       (message) => message.role === 'system' || message.role === 'developer',
@@ -1213,9 +1277,9 @@ const buildResponsesBodyFromChat = (
     ];
   });
   const text = translateChatResponseFormatToResponses(body.response_format);
-  const reasoning = translateChatThinkingToResponses(
-    body.thinking,
-    body.reasoning_effort,
+  const reasoning = await resolveHyResponsesReasoning(
+    body.model,
+    translateChatThinkingToResponses(body.thinking, body.reasoning_effort),
   );
 
   return {
@@ -1382,6 +1446,7 @@ const mapResponsesStreamToChat = (
   stop: string | string[] | undefined,
   includeUsage: boolean,
 ): Response => {
+  const closer = createStreamCloser();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const responseId = `chatcmpl-${crypto.randomUUID()}`;
@@ -1512,6 +1577,13 @@ const mapResponsesStreamToChat = (
           await recordStreamUsage();
           reader.releaseLock();
           reader = null;
+          const timeoutMessage = toUpstreamTimeoutMessage(error);
+
+          if (timeoutMessage !== null) {
+            closer.fail(controller, chatStreamErrorChunks(timeoutMessage));
+            return;
+          }
+
           controller.error(error);
           return;
         }
@@ -1577,6 +1649,17 @@ const mapResponsesStreamToChat = (
             .split(/\r?\n/)
             .find((line) => line.startsWith('data: '));
           if (!dataLine || dataLine === 'data: [DONE]') continue;
+          // The upstream here is the chat pipeline, which reports a deadline as
+          // a terminal error chunk and closes cleanly. Without this the failure
+          // would be reported to the client as an empty successful response.
+          const upstreamError = readTimeoutFrame(frame);
+
+          if (upstreamError !== null) {
+            closer.fail(controller, chatStreamErrorChunks(upstreamError));
+            await cancelAndReleaseReader();
+            await recordStreamUsage();
+            return;
+          }
           try {
             const event = JSON.parse(dataLine.slice(6)) as {
               delta?: unknown;
@@ -2080,6 +2163,7 @@ const normalizeStreamingResponse = ({
   };
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let cancelled = false;
+  const closer = createStreamCloser();
   const releaseReader = (): void => {
     reader?.releaseLock();
     reader = null;
@@ -2183,10 +2267,21 @@ const normalizeStreamingResponse = ({
         }
       };
 
-      void pump();
+      void pump().catch((error) => {
+        if (cancelled) return;
+        const timeoutMessage = toUpstreamTimeoutMessage(error);
+
+        if (timeoutMessage !== null) {
+          closer.fail(controller, chatStreamErrorChunks(timeoutMessage));
+          return;
+        }
+
+        controller.error(error);
+      });
     },
     async cancel(reason): Promise<void> {
       cancelled = true;
+      closer.mark();
       try {
         await reader?.cancel(reason);
       } finally {
@@ -2330,6 +2425,244 @@ const aggregateUpstreamStream = async (
     }),
     usage,
   };
+};
+
+const isServerWebToolName = (name: string): boolean => {
+  const normalized = normalizeToolName(name);
+
+  return (
+    normalized === normalizeToolName(WEB_SEARCH_TOOL_NAME) ||
+    normalized === normalizeToolName(WEB_FETCH_TOOL_NAME)
+  );
+};
+
+const SERVER_WEB_TOOL_NAMES = [
+  normalizeToolName(WEB_SEARCH_TOOL_NAME),
+  normalizeToolName(WEB_FETCH_TOOL_NAME),
+];
+
+interface StreamProbeState {
+  toolNames: Map<string, string>;
+}
+
+const mergeToolName = (previous: string, incoming: string): string => {
+  if (!previous || incoming.startsWith(previous)) {
+    return incoming;
+  }
+
+  if (!incoming || previous.endsWith(incoming)) {
+    return previous;
+  }
+
+  return previous + incoming;
+};
+
+const classifyStreamFrame = (
+  frame: string,
+  state: StreamProbeState,
+  serverToolNames: string[],
+): 'passthrough' | 'server-tool' | null => {
+  const line = frame
+    .split('\n')
+    .find((segment) => segment.startsWith('data: '));
+
+  if (!line) {
+    return null;
+  }
+
+  const raw = line.slice(6).trim();
+
+  if (!raw || raw === '[DONE]') {
+    return raw === '[DONE]' ? 'passthrough' : null;
+  }
+
+  try {
+    const chunk = JSON.parse(raw) as ChatStreamChunk;
+
+    for (const choice of chunk.choices ?? []) {
+      const delta = choice.delta;
+      const toolCalls = delta?.tool_calls ?? [];
+      let hasNonServerTool = false;
+
+      for (const [position, toolCall] of toolCalls.entries()) {
+        const incoming = toolCall.function?.name;
+
+        if (typeof incoming !== 'string' || !incoming) {
+          continue;
+        }
+
+        const key =
+          typeof toolCall.index === 'number'
+            ? `index:${toolCall.index}`
+            : toolCall.id
+              ? `id:${toolCall.id}`
+              : `position:${position}`;
+        const name = mergeToolName(state.toolNames.get(key) ?? '', incoming);
+        const normalized = normalizeToolName(name);
+
+        state.toolNames.set(key, name);
+
+        if (isServerWebToolName(name) && serverToolNames.includes(normalized)) {
+          return 'server-tool';
+        }
+
+        if (
+          normalized &&
+          !serverToolNames.some((serverName) =>
+            serverName.startsWith(normalized),
+          )
+        ) {
+          hasNonServerTool = true;
+        }
+      }
+
+      if (
+        delta?.content ||
+        delta?.reasoning_content ||
+        delta?.reasoning ||
+        hasNonServerTool ||
+        choice.finish_reason != null
+      ) {
+        return 'passthrough';
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+};
+
+const concatenateChunks = (chunks: Uint8Array[]): ArrayBuffer => {
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const combined = new Uint8Array(size);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return combined.buffer;
+};
+
+const createResponseWithBody = (body: BodyInit, response: Response): Response =>
+  new Response(body, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+
+const createReplayStreamResponse = ({
+  chunks,
+  reader,
+  response,
+}: {
+  chunks: Uint8Array[];
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  response: Response;
+}): Response => {
+  let cancelled = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start: (controller) => {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+
+      const pump = async (): Promise<void> => {
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (cancelled) {
+            return;
+          }
+
+          if (done) {
+            reader.releaseLock();
+            controller.close();
+            return;
+          }
+
+          controller.enqueue(value);
+        }
+      };
+
+      void pump().catch((error) => {
+        if (!cancelled) {
+          controller.error(error);
+        }
+      });
+    },
+    async cancel(reason): Promise<void> {
+      cancelled = true;
+      try {
+        await reader.cancel(reason);
+      } finally {
+        reader.releaseLock();
+      }
+    },
+  });
+
+  return createResponseWithBody(stream, response);
+};
+
+const detectServerToolStream = async (
+  response: Response,
+  fallbackModel: string,
+  serverToolNames: string[],
+): Promise<Response> => {
+  if (!response.body) {
+    return response;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: Uint8Array[] = [];
+  const state: StreamProbeState = { toolNames: new Map() };
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      reader.releaseLock();
+      return createResponseWithBody(concatenateChunks(chunks), response);
+    }
+
+    chunks.push(value);
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+
+    for (const frame of frames) {
+      const classification = classifyStreamFrame(frame, state, serverToolNames);
+
+      if (classification === 'passthrough') {
+        return createReplayStreamResponse({ chunks, reader, response });
+      }
+
+      if (classification === 'server-tool') {
+        while (true) {
+          const remainder = await reader.read();
+
+          if (remainder.done) {
+            reader.releaseLock();
+            break;
+          }
+
+          chunks.push(remainder.value);
+        }
+
+        return (
+          await aggregateUpstreamStream(
+            new Response(concatenateChunks(chunks)),
+            fallbackModel,
+          )
+        ).response;
+      }
+    }
+  }
 };
 
 export const getModelsForCredential = async ({
@@ -2557,12 +2890,148 @@ export const getModelsResponse = async (
   });
 };
 
+/**
+ * One round trip to `/v2/chat/completions`. Split out from
+ * `proxyChatCompletions` so the local web search loop can re-issue the request
+ * with tool results appended without re-deriving auth, headers, or usage
+ * recording on each iteration.
+ *
+ * Upstream is always asked to stream; `stream` only controls the shape handed
+ * back to the caller, so it must echo what the client asked for rather than
+ * being read off `upstreamBody`.
+ */
+const fetchChatCompletion = async ({
+  body,
+  debugTrace,
+  request,
+  resolvedContext,
+  stream,
+  upstreamBody: providedUpstreamBody,
+  usageRoute,
+}: {
+  body: ChatRequestBody;
+  debugTrace?: DebugTrace;
+  request: NextRequest;
+  resolvedContext: ProxyContext;
+  /**
+   * Whether the caller wants an SSE stream back. Upstream is always asked to
+   * stream regardless — it rejects `stream: false` with code 11101 — so this
+   * only chooses between passing the stream through and buffering it into a
+   * single JSON payload.
+   */
+  stream: boolean;
+  upstreamBody?: ChatRequestBody;
+  usageRoute: string;
+}): Promise<Response> => {
+  const apiEndpoint = await getCodeBuddyApiEndpoint();
+  const upstreamUrl = `${apiEndpoint}/v2/chat/completions`;
+  const upstreamHeaders = await buildUpstreamHeaders(
+    request,
+    resolvedContext.auth,
+  );
+  const upstreamBody =
+    providedUpstreamBody ?? (await buildUpstreamBody(body, resolvedContext));
+
+  setDebugUpstreamRequest(debugTrace, {
+    body: upstreamBody,
+    headers: headersToRecord(upstreamHeaders),
+    method: 'POST',
+    url: upstreamUrl,
+  });
+
+  const upstream = await fetchWithDeadline({
+    body: JSON.stringify(upstreamBody),
+    headers: upstreamHeaders,
+    onTimeout: (error) => setDebugTraceError(debugTrace, error),
+    timeoutMs: await getApiFirstDeltaTimeoutMs(),
+    url: upstreamUrl,
+  });
+
+  if (!upstream.ok) {
+    return upstream.response;
+  }
+
+  const upstreamResponse = enqueueUpstreamResponseSnapshot(
+    debugTrace,
+    upstream.response,
+  );
+
+  if (!upstreamResponse.ok) {
+    const detail = await upstreamResponse.text();
+    logUpstreamFailure({
+      detail,
+      route: '/v1/chat/completions',
+      status: upstreamResponse.status,
+      url: upstreamUrl,
+    });
+    setDebugTraceError(debugTrace, detail);
+    return createErrorResponse(
+      upstreamResponse.status,
+      'Upstream CodeBuddy request failed',
+      detail,
+    );
+  }
+
+  const contentType = upstreamResponse.headers.get('content-type') ?? '';
+
+  if (stream && !contentType.toLowerCase().includes('application/json')) {
+    return normalizeStreamingResponse({
+      model: String(upstreamBody.model ?? 'unknown'),
+      proxyContext: resolvedContext,
+      route: usageRoute,
+      upstreamResponse,
+    });
+  }
+
+  // Upstream only accepts `stream: true`, so a non-streaming caller is served
+  // by buffering the SSE response and folding it into a single JSON payload.
+  if (contentType.toLowerCase().includes('application/json')) {
+    const payloadText = await upstreamResponse.text();
+    let usage: unknown = null;
+
+    try {
+      usage = (JSON.parse(payloadText) as { usage?: unknown }).usage ?? null;
+    } catch {
+      usage = null;
+    }
+
+    await recordProxyUsage({
+      model: String(upstreamBody.model ?? 'unknown'),
+      proxyContext: resolvedContext,
+      route: usageRoute,
+      usage,
+    });
+
+    return new Response(payloadText, {
+      status: upstreamResponse.status,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+    });
+  }
+
+  const aggregated = await aggregateUpstreamStream(
+    upstreamResponse,
+    String(upstreamBody.model ?? 'unknown'),
+  );
+
+  await recordProxyUsage({
+    model: aggregated.model,
+    proxyContext: resolvedContext,
+    route: usageRoute,
+    usage: aggregated.usage,
+  });
+
+  return aggregated.response;
+};
+
 export const proxyChatCompletions = async (
   request: NextRequest,
   body: ChatRequestBody,
   context?: ProxyContext,
   debugTrace?: DebugTrace,
   usageRoute = '/v1/chat/completions',
+  serverToolCallbacks?: ServerToolCallbacks,
 ): Promise<Response> => {
   if (!body.messages?.length) {
     return createErrorResponse(400, 'messages is required');
@@ -2572,7 +3041,98 @@ export const proxyChatCompletions = async (
     const resolvedContext =
       context ?? (await resolveProxyContext(request, body.model));
     setDebugTraceCredential(debugTrace, resolvedContext.credentialFilename);
-    const upstreamBody = await buildUpstreamBody(body, resolvedContext);
+    let upstreamBody = await buildUpstreamBody(body, resolvedContext);
+
+    // Server-side web tools run on the chat path only. The Responses
+    // passthrough path forwards to CodeBuddy's own /responses endpoint, where
+    // re-issuing a request with a synthesized tool result would mean replaying
+    // the whole conversation through a different protocol for each iteration.
+    if (resolvedContext.preferences.upstreamProtocol === 'chat') {
+      const webSearch = await withCodeBuddyToken(
+        // The CodeBuddy backends call the agent-tool endpoints with the same
+        // credential as this request, so the loop is scoped to it. Resolved
+        // lazily: a token is only needed when a CodeBuddy backend actually runs.
+        () => Promise.resolve(resolvedContext.auth.bearerToken),
+        () =>
+          executeWebSearchLoop({
+            body: upstreamBody,
+            callbacks: serverToolCallbacks,
+            callUpstream: async (loopBody, mode) => {
+              const upstreamResponse = await fetchChatCompletion({
+                body: loopBody,
+                debugTrace,
+                request,
+                resolvedContext,
+                // Probe the first meaningful SSE delta for streaming callers.
+                // Ordinary content stays live; only a server-tool call is
+                // buffered into a payload the execution loop can inspect.
+                stream: mode !== 'buffer',
+                // Already normalized, so pass it straight through; re-running
+                // buildUpstreamBody each iteration would re-apply prompt cache
+                // markers to the appended tool results.
+                upstreamBody: { ...loopBody, stream: true },
+                usageRoute,
+              });
+
+              const detectedNames =
+                mode === 'detect-both'
+                  ? SERVER_WEB_TOOL_NAMES
+                  : mode === 'detect-search'
+                    ? [normalizeToolName(WEB_SEARCH_TOOL_NAME)]
+                    : [normalizeToolName(WEB_FETCH_TOOL_NAME)];
+
+              if (mode === 'stream' || mode === 'buffer') {
+                return upstreamResponse;
+              }
+
+              return detectServerToolStream(
+                upstreamResponse,
+                String(loopBody.model ?? 'unknown'),
+                detectedNames,
+              );
+            },
+            detectInitialStream: Boolean(body.stream),
+          }),
+      );
+
+      // No tool could be executed, so the loop declined to run. Its rewritten
+      // `tools` still matter: unsupported server-tool declarations have been
+      // stripped, and continuing with them keeps the request valid upstream
+      // instead of forwarding a declaration it would reject.
+      if (webSearch && !webSearch.response) {
+        upstreamBody = webSearch.body;
+      }
+
+      if (webSearch?.response) {
+        if (!webSearch.response.ok) {
+          return attachServerToolExecutions(
+            webSearch.response,
+            webSearch.executions,
+          );
+        }
+
+        if (
+          body.stream &&
+          !webSearch.response.headers
+            .get('content-type')
+            ?.toLowerCase()
+            .includes('text/event-stream')
+        ) {
+          return attachServerToolExecutions(
+            synthesizeChatCompletionStream(
+              (await webSearch.response.json()) as ChatCompletionPayload,
+              String(upstreamBody.model ?? 'unknown'),
+            ),
+            webSearch.executions,
+          );
+        }
+
+        return attachServerToolExecutions(
+          webSearch.response,
+          webSearch.executions,
+        );
+      }
+    }
 
     if (resolvedContext.preferences.upstreamProtocol === 'responses') {
       const unsupportedOptions = getUnsupportedResponsesChatOptions(body);
@@ -2590,7 +3150,7 @@ export const proxyChatCompletions = async (
         await buildUpstreamHeaders(request, resolvedContext.auth),
       );
       const responsesBody = {
-        ...buildResponsesBodyFromChat(upstreamBody),
+        ...(await buildResponsesBodyFromChat(upstreamBody)),
         stream: Boolean(body.stream),
       };
 
@@ -2601,15 +3161,21 @@ export const proxyChatCompletions = async (
         url: upstreamUrl,
       });
 
-      let upstreamResponse = await fetch(upstreamUrl, {
-        method: 'POST',
-        headers: upstreamHeaders,
+      const upstream = await fetchWithDeadline({
         body: JSON.stringify(responsesBody),
-        cache: 'no-store',
+        headers: upstreamHeaders,
+        onTimeout: (error) => setDebugTraceError(debugTrace, error),
+        timeoutMs: await getApiFirstDeltaTimeoutMs(),
+        url: upstreamUrl,
       });
-      upstreamResponse = enqueueUpstreamResponseSnapshot(
+
+      if (!upstream.ok) {
+        return upstream.response;
+      }
+
+      const upstreamResponse = enqueueUpstreamResponseSnapshot(
         debugTrace,
-        upstreamResponse,
+        upstream.response,
       );
 
       if (!upstreamResponse.ok) {
@@ -2688,16 +3254,21 @@ export const proxyChatCompletions = async (
       url: upstreamUrl,
     });
 
-    let upstreamResponse = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: upstreamHeaders,
+    const upstream = await fetchWithDeadline({
       body: JSON.stringify(upstreamBody),
-      cache: 'no-store',
+      headers: upstreamHeaders,
+      onTimeout: (error) => setDebugTraceError(debugTrace, error),
+      timeoutMs: await getApiFirstDeltaTimeoutMs(),
+      url: upstreamUrl,
     });
 
-    upstreamResponse = enqueueUpstreamResponseSnapshot(
+    if (!upstream.ok) {
+      return upstream.response;
+    }
+
+    const upstreamResponse = enqueueUpstreamResponseSnapshot(
       debugTrace,
-      upstreamResponse,
+      upstream.response,
     );
 
     if (!upstreamResponse.ok) {
@@ -2795,7 +3366,7 @@ export const proxyResponsesUpstream = async (
       ));
     setDebugTraceCredential(debugTrace, resolvedContext.credentialFilename);
     const upstreamBody = {
-      ...normalizeResponsesUpstreamBody(body),
+      ...(await normalizeResponsesUpstreamBody(body)),
       model:
         typeof body.model === 'string' && body.model.trim()
           ? body.model
@@ -2816,16 +3387,28 @@ export const proxyResponsesUpstream = async (
       url: upstreamUrl,
     });
 
-    let upstreamResponse = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: upstreamHeaders,
+    const upstream = await fetchWithDeadline({
       body: JSON.stringify(upstreamBody),
-      cache: 'no-store',
+      headers: upstreamHeaders,
+      onTimeout: (error) => {
+        setDebugTraceError(debugTrace, error);
+        logUpstreamFailure({
+          error,
+          route: '/v1/responses',
+          url: upstreamUrl,
+        });
+      },
+      timeoutMs: await getApiFirstDeltaTimeoutMs(),
+      url: upstreamUrl,
     });
 
-    upstreamResponse = enqueueUpstreamResponseSnapshot(
+    if (!upstream.ok) {
+      return upstream.response;
+    }
+
+    const upstreamResponse = enqueueUpstreamResponseSnapshot(
       debugTrace,
-      upstreamResponse,
+      upstream.response,
     );
 
     if (!upstreamResponse.ok) {
@@ -2846,6 +3429,7 @@ export const proxyResponsesUpstream = async (
 
     const model = String(upstreamBody.model ?? 'unknown');
     const fallbackUsage = parseUsageHeader(upstreamResponse);
+
     const contentType = upstreamResponse.headers.get('content-type') ?? '';
 
     if (contentType.toLowerCase().includes('application/json')) {

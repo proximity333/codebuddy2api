@@ -1,8 +1,22 @@
 import type { NextRequest } from 'next/server';
 
-import { getDefaultModel } from '../domain/config';
+import {
+  getDefaultModel,
+  isWebFetchEnabled,
+  isWebSearchEnabled,
+} from '../domain/config';
 import { getCredentialSupportedModels } from '../domain/credentials';
 import type { DebugTrace } from '../domain/debug';
+import {
+  buildWebFetchToolDefinition,
+  buildWebSearchToolDefinition,
+  markServerTool,
+  normalizeToolName,
+  WEB_FETCH_TOOL_NAME,
+  WEB_FETCH_TOOL_TYPE_PREFIX,
+  WEB_SEARCH_TOOL_NAME,
+  WEB_SEARCH_TOOL_TYPE_PREFIX,
+} from '../search/tool';
 import {
   proxyChatCompletions,
   proxyResponsesUpstream,
@@ -10,8 +24,19 @@ import {
   resolveProxyContextByCredentialFilename,
   type ProxyContext,
 } from './codebuddy';
+import {
+  getServerToolExecutions,
+  type ServerToolExecution,
+  type ServerToolInvocation,
+} from './web-search-loop';
 import { resolveRequestAccessKey } from './auth';
 import { createErrorResponse } from '../shared/http';
+import {
+  createStreamCloser,
+  readTimeoutFrame,
+  responsesStreamErrorChunks,
+  toUpstreamTimeoutMessage,
+} from '../shared/upstream-timeout';
 import {
   deleteStorageJson,
   getStorageBackendMeta,
@@ -37,6 +62,16 @@ interface SupportedChatTool {
   kind: 'custom' | 'function' | 'mcp' | 'tool_search';
   namespace?: string;
   originalName: string;
+  /**
+   * True when the client declared this as a provider-executed server tool
+   * (`web_search_20260209`, `web_fetch_20250910`, `web_search_preview`) rather
+   * than as its own function.
+   *
+   * Translation turns both into ordinary functions for upstream, so without this
+   * the proxy cannot tell them apart later — and the difference decides whether a
+   * tool that cannot be executed is dropped or forwarded.
+   */
+  serverDeclared?: boolean;
   serverLabel?: string;
   tool: Record<string, unknown>;
 }
@@ -113,8 +148,14 @@ interface StreamingToolCallState {
 }
 
 interface StreamingMessageState {
-  outputIndex: number;
+  outputIndex: number | null;
   outputItemId: string;
+}
+
+interface ResponsesServerToolItem {
+  completed: Record<string, unknown>;
+  inProgress: Record<string, unknown>;
+  outputIndex: number;
 }
 
 interface ResponseSessionMetadata {
@@ -196,7 +237,16 @@ const pruneResponseSessions = (): void => {
     getSessionTotalBytes() > MAX_RESPONSE_SESSION_TOTAL_BYTES
   ) {
     const oldestId = store.keys().next().value;
-    removeLocalResponseSession(oldestId!);
+
+    // Guard against a byte total that has drifted out of step with the map.
+    // Without this, an empty map with a positive total makes the removal a
+    // no-op and spins here forever, blocking the event loop.
+    if (oldestId === undefined) {
+      setSessionTotalBytes(0);
+      break;
+    }
+
+    removeLocalResponseSession(oldestId);
   }
 };
 
@@ -427,6 +477,49 @@ const toSupportedChatTool = (
   namespace?: string,
 ): SupportedChatTool[] => {
   const toolType = typeof tool.type === 'string' ? tool.type : 'function';
+
+  // Server-side search and fetch carry no function schema, so the generic
+  // branch below drops them. Emit them as functions unconditionally and let
+  // the proxy loop resolve the configured backend asynchronously. SearXNG
+  // needs local configuration, while CodeBuddy search does not.
+  if (
+    normalizeToolName(toolType).startsWith(
+      normalizeToolName(WEB_SEARCH_TOOL_TYPE_PREFIX),
+    )
+  ) {
+    const definition = buildWebSearchToolDefinition();
+
+    return [
+      {
+        chatName: WEB_SEARCH_TOOL_NAME,
+        kind: 'function',
+        originalName: WEB_SEARCH_TOOL_NAME,
+        serverDeclared: true,
+        tool: definition,
+      },
+    ];
+  }
+
+  // Fetch needs no deployment-level configuration — the local backend is always
+  // available and the CodeBuddy backend needs only a credential — so it is
+  // advertised unconditionally and gated later by the enable toggle.
+  if (
+    normalizeToolName(toolType).startsWith(
+      normalizeToolName(WEB_FETCH_TOOL_TYPE_PREFIX),
+    )
+  ) {
+    const definition = buildWebFetchToolDefinition();
+
+    return [
+      {
+        chatName: WEB_FETCH_TOOL_NAME,
+        kind: 'function',
+        originalName: WEB_FETCH_TOOL_NAME,
+        serverDeclared: true,
+        tool: definition,
+      },
+    ];
+  }
 
   if (toolType === 'namespace') {
     const namespaceName = typeof tool.name === 'string' ? tool.name.trim() : '';
@@ -758,6 +851,7 @@ export const translateResponsesToolsToChat = (
     return {
       type: 'function',
       function: tool.tool,
+      ...(tool.serverDeclared ? markServerTool({}) : {}),
     };
   });
 };
@@ -1131,6 +1225,7 @@ const mapChatResponseToResponsesPayload = async (
   model: string,
   previousResponseId: string | null,
   upstreamPayload: Record<string, unknown>,
+  serverToolExecutions: ServerToolExecution[],
 ): Promise<Record<string, unknown>> => {
   const responseId = createResponseId();
   const choices = Array.isArray(upstreamPayload.choices)
@@ -1144,7 +1239,9 @@ const mapChatResponseToResponsesPayload = async (
     : [];
   const outputText = stringifyContent(firstChoice.message?.content);
   const createdAt = Math.floor(Date.now() / 1000);
-  const output: Array<Record<string, unknown>> = [];
+  const output: Array<Record<string, unknown>> = serverToolExecutions.map(
+    (execution) => buildResponsesWebSearchCallItem(execution, 'completed'),
+  );
   const transcriptToolCalls = buildAssistantTranscriptToolCalls(
     toolCalls,
     defaults.tools,
@@ -1210,56 +1307,78 @@ const mapChatResponseToResponsesPayload = async (
   };
 };
 
-const createResponsesEventStream = async (
-  request: NextRequest,
+const buildResponsesWebSearchCallItem = (
+  execution: ServerToolExecution | ServerToolInvocation,
+  status: 'completed' | 'in_progress',
+  id = `ws_${crypto.randomUUID().replaceAll('-', '')}`,
+): Record<string, unknown> => ({
+  id,
+  type: 'web_search_call',
+  status,
+  action:
+    execution.type === 'web_search'
+      ? { type: 'search', query: execution.input.query }
+      : {
+          type: 'open_page',
+          url:
+            'result' in execution
+              ? (execution.result.url ?? execution.input.url)
+              : execution.input.url,
+        },
+});
+
+const mapChatStreamToResponsesEventStream = (
+  upstreamResponse: Response,
   defaults: ResponseSessionDefaults,
   transcript: TranscriptMessage[],
   model: string,
   previousResponseId: string | null,
-  maxOutputTokens: number | undefined,
   proxyContext: ProxyContext,
-  debugTrace?: DebugTrace,
-): Promise<Response> => {
-  const upstreamResponse = await proxyChatCompletions(
-    request,
-    {
-      model,
-      messages: [
-        ...(defaults.instructions
-          ? [{ role: 'system', content: defaults.instructions }]
-          : []),
-        ...normalizeTranscriptMessageToolNames(transcript, defaults.tools),
-      ],
-      max_tokens: maxOutputTokens,
-      stream: true,
-      tools: translateResponsesToolsToChat(defaults.tools),
-      tool_choice: translateResponsesToolChoiceToChatWithTools(
-        defaults.tools,
-        defaults.tool_choice,
-      ),
-    },
-    proxyContext,
-    debugTrace,
-    '/v1/responses',
-  );
-
+  responseId = createResponseId(),
+  providedServerToolItems?: ResponsesServerToolItem[],
+  emitOpeningEvents = true,
+  emitServerToolLifecycle = true,
+  providedOutputIndexAllocator?: () => number,
+  rejectErrorPayloads = false,
+): Response => {
   if (!upstreamResponse.ok || !upstreamResponse.body) {
     return upstreamResponse;
   }
 
-  const responseId = createResponseId();
+  const serverToolItems =
+    providedServerToolItems ??
+    getServerToolExecutions(upstreamResponse).map((execution, outputIndex) => {
+      const id = `ws_${crypto.randomUUID().replaceAll('-', '')}`;
+
+      return {
+        completed: buildResponsesWebSearchCallItem(execution, 'completed', id),
+        inProgress: buildResponsesWebSearchCallItem(
+          execution,
+          'in_progress',
+          id,
+        ),
+        outputIndex,
+      };
+    });
   let outputText = '';
+  let nextOutputIndex =
+    serverToolItems.reduce(
+      (maximum, item) => Math.max(maximum, item.outputIndex),
+      -1,
+    ) + 1;
+  const allocateOutputIndex =
+    providedOutputIndexAllocator ?? (() => nextOutputIndex++);
   const messageState: StreamingMessageState = {
-    outputIndex: 0,
+    outputIndex: null,
     outputItemId: createMessageId(),
   };
   let messageAddedEmitted = false;
   const toolCallStates = new Map<string, StreamingToolCallState>();
   const toolCallStateKeys = new Map<string, string>();
-  let nextToolCallOutputIndex = 1;
   let latestUsage: unknown = null;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let cancelled = false;
+  const closer = createStreamCloser();
   const releaseReader = (): void => {
     reader?.releaseLock();
     reader = null;
@@ -1306,6 +1425,7 @@ const createResponsesEventStream = async (
           return;
         }
 
+        messageState.outputIndex ??= allocateOutputIndex();
         enqueueEvent({
           type: 'response.output_item.added',
           item: buildStreamingMessageItem('in_progress'),
@@ -1315,23 +1435,57 @@ const createResponsesEventStream = async (
         messageAddedEmitted = true;
       };
 
-      enqueueEvent({
-        type: 'response.created',
-        response: {
-          id: responseId,
-          object: 'response',
-          created_at: Math.floor(Date.now() / 1000),
-          model,
-          output: [],
-        },
-      });
-      enqueueEvent({
-        type: 'response.in_progress',
-        response: {
-          id: responseId,
-          status: 'in_progress',
-        },
-      });
+      if (emitOpeningEvents) {
+        enqueueEvent({
+          type: 'response.created',
+          response: {
+            id: responseId,
+            object: 'response',
+            created_at: Math.floor(Date.now() / 1000),
+            model,
+            output: [],
+          },
+        });
+        enqueueEvent({
+          type: 'response.in_progress',
+          response: {
+            id: responseId,
+            status: 'in_progress',
+          },
+        });
+      }
+      if (emitServerToolLifecycle) {
+        serverToolItems.forEach(({ completed, inProgress, outputIndex }) => {
+          const itemId = String(inProgress.id);
+          enqueueEvent({
+            type: 'response.output_item.added',
+            item: inProgress,
+            output_index: outputIndex,
+            response_id: responseId,
+          });
+          enqueueEvent({
+            type: 'response.web_search_call.in_progress',
+            item_id: itemId,
+            output_index: outputIndex,
+          });
+          enqueueEvent({
+            type: 'response.web_search_call.searching',
+            item_id: itemId,
+            output_index: outputIndex,
+          });
+          enqueueEvent({
+            type: 'response.web_search_call.completed',
+            item_id: itemId,
+            output_index: outputIndex,
+          });
+          enqueueEvent({
+            type: 'response.output_item.done',
+            item: completed,
+            output_index: outputIndex,
+            response_id: responseId,
+          });
+        });
+      }
 
       const maybeEmitToolCallAdded = (
         toolCallState: StreamingToolCallState,
@@ -1485,19 +1639,31 @@ const createResponsesEventStream = async (
                 previous_response_id: previousResponseId,
                 usage: mapChatUsageToResponses(latestUsage),
                 output: [
-                  ...(outputText
-                    ? [buildStreamingMessageItem('completed')]
+                  ...serverToolItems.map(({ completed, outputIndex }) => ({
+                    item: completed,
+                    outputIndex,
+                  })),
+                  ...(outputText && messageState.outputIndex !== null
+                    ? [
+                        {
+                          item: buildStreamingMessageItem('completed'),
+                          outputIndex: messageState.outputIndex,
+                        },
+                      ]
                     : []),
-                  ...[...toolCallStates.values()].map((toolCallState) =>
-                    buildResponsesToolCallOutputItem(defaults.tools, {
+                  ...[...toolCallStates.values()].map((toolCallState) => ({
+                    item: buildResponsesToolCallOutputItem(defaults.tools, {
                       arguments: toolCallState.arguments,
                       callId: toolCallState.callId,
                       id: toolCallState.outputItemId,
                       name: toolCallState.name || 'function',
                       status: 'completed',
                     }),
-                  ),
-                ],
+                    outputIndex: toolCallState.outputIndex,
+                  })),
+                ]
+                  .sort((left, right) => left.outputIndex - right.outputIndex)
+                  .map(({ item }) => item),
               },
             });
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
@@ -1534,6 +1700,20 @@ const createResponsesEventStream = async (
               continue;
             }
 
+            // The upstream here is the chat pipeline, which reports a deadline
+            // as a terminal error chunk and closes cleanly. Surfacing it keeps
+            // the client from seeing an empty successful response.
+            const upstreamError = readTimeoutFrame(frame);
+
+            if (upstreamError !== null) {
+              streamRejected = true;
+              enqueueEvent({
+                type: 'response.error',
+                error: { message: upstreamError },
+              });
+              break;
+            }
+
             try {
               const payload = JSON.parse(raw) as {
                 choices?: Array<{
@@ -1543,8 +1723,28 @@ const createResponsesEventStream = async (
                     tool_calls?: ChatResponseToolCall[];
                   };
                 }>;
+                error?: unknown;
                 usage?: unknown;
               };
+              if (rejectErrorPayloads && payload.error) {
+                const error =
+                  typeof payload.error === 'object'
+                    ? (payload.error as { message?: unknown })
+                    : null;
+                streamRejected = true;
+                enqueueEvent({
+                  type: 'response.error',
+                  error: {
+                    message:
+                      typeof error?.message === 'string'
+                        ? error.message
+                        : typeof payload.error === 'string'
+                          ? payload.error
+                          : 'Upstream request failed',
+                  },
+                });
+                break;
+              }
               // The final upstream chunk carries the aggregated usage, so
               // remember it for the downstream response.completed event.
               if (payload.usage !== undefined) {
@@ -1561,7 +1761,12 @@ const createResponsesEventStream = async (
                 enqueueEvent({
                   type: 'response.output_text.delta',
                   delta: delta.content,
-                  item: buildStreamingMessageItem('in_progress'),
+                  // Send only the item reference: embedding the accumulated
+                  // text re-serializes it on every delta, which makes the
+                  // enqueued volume quadratic in the output size. The full
+                  // text still arrives intact in response.output_text.done
+                  // and response.completed.
+                  item_id: messageState.outputItemId,
                   output_index: messageState.outputIndex,
                   response_id: responseId,
                 });
@@ -1586,16 +1791,17 @@ const createResponsesEventStream = async (
                 const canonicalKey =
                   existingCanonicalKey ??
                   getStreamingToolCallCanonicalKey(toolCall, position);
-                const current = toolCallStates.get(canonicalKey) ?? {
+                const existing = toolCallStates.get(canonicalKey);
+                const outputIndex = existing
+                  ? existing.outputIndex
+                  : allocateOutputIndex();
+                const current = existing ?? {
                   addedEmitted: false,
                   arguments: '',
                   canonicalKey,
-                  callId: normalizeToolCallId(
-                    toolCall.id,
-                    nextToolCallOutputIndex,
-                  ),
+                  callId: normalizeToolCallId(toolCall.id, outputIndex),
                   name: '',
-                  outputIndex: nextToolCallOutputIndex++,
+                  outputIndex,
                   outputItemId: createResponseOutputId(),
                   pendingArgumentDeltas: [],
                 };
@@ -1692,10 +1898,28 @@ const createResponsesEventStream = async (
         }
       };
 
-      void pump();
+      void pump().catch((error) => {
+        if (cancelled) return;
+        const timeoutMessage = toUpstreamTimeoutMessage(error);
+
+        if (timeoutMessage === null) {
+          closer.mark();
+          controller.error(error);
+          return;
+        }
+
+        streamRejected = true;
+        void reader?.cancel().then(
+          () => undefined,
+          () => undefined,
+        );
+        releaseReader();
+        closer.fail(controller, responsesStreamErrorChunks(timeoutMessage));
+      });
     },
     async cancel(reason): Promise<void> {
       cancelled = true;
+      closer.mark();
       try {
         await reader?.cancel(reason);
       } finally {
@@ -1706,6 +1930,254 @@ const createResponsesEventStream = async (
 
   return new Response(stream, {
     status: 200,
+    headers: {
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'Content-Type': 'text/event-stream; charset=utf-8',
+    },
+  });
+};
+
+const createResponsesEventStream = async (
+  request: NextRequest,
+  defaults: ResponseSessionDefaults,
+  transcript: TranscriptMessage[],
+  model: string,
+  previousResponseId: string | null,
+  maxOutputTokens: number | undefined,
+  proxyContext: ProxyContext,
+  debugTrace?: DebugTrace,
+): Promise<Response> => {
+  const translatedTools = translateResponsesToolsToChat(defaults.tools);
+  const translatedToolNames = new Set(
+    (
+      (translatedTools ?? []) as Array<{
+        function: { name: string };
+      }>
+    ).map((tool) => normalizeToolName(tool.function.name)),
+  );
+  const [searchEnabled, fetchEnabled] = await Promise.all([
+    translatedToolNames.has(normalizeToolName(WEB_SEARCH_TOOL_NAME))
+      ? isWebSearchEnabled()
+      : false,
+    translatedToolNames.has(normalizeToolName(WEB_FETCH_TOOL_NAME))
+      ? isWebFetchEnabled()
+      : false,
+  ]);
+
+  if (!searchEnabled && !fetchEnabled) {
+    const upstreamResponse = await proxyChatCompletions(
+      request,
+      {
+        model,
+        messages: [
+          ...(defaults.instructions
+            ? [{ role: 'system', content: defaults.instructions }]
+            : []),
+          ...normalizeTranscriptMessageToolNames(transcript, defaults.tools),
+        ],
+        max_tokens: maxOutputTokens,
+        stream: true,
+        tools: translatedTools,
+        tool_choice: translateResponsesToolChoiceToChatWithTools(
+          defaults.tools,
+          defaults.tool_choice,
+        ),
+      },
+      proxyContext,
+      debugTrace,
+      '/v1/responses',
+    );
+
+    return mapChatStreamToResponsesEventStream(
+      upstreamResponse,
+      defaults,
+      transcript,
+      model,
+      previousResponseId,
+      proxyContext,
+    );
+  }
+
+  const encoder = new TextEncoder();
+  const responseId = createResponseId();
+  const serverToolItems: ResponsesServerToolItem[] = [];
+  const itemsByInvocationId = new Map<string, ResponsesServerToolItem>();
+  let nextOutputIndex = 0;
+  const allocateOutputIndex = (): number => nextOutputIndex++;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let cancelled = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start: (controller) => {
+      const enqueueEvent = (
+        payload: Record<string, unknown> & { type: string },
+      ): void => {
+        if (cancelled) return;
+        controller.enqueue(
+          encoder.encode(
+            `event: ${payload.type}\ndata: ${JSON.stringify(payload)}\n\n`,
+          ),
+        );
+      };
+
+      enqueueEvent({
+        type: 'response.created',
+        response: {
+          id: responseId,
+          object: 'response',
+          created_at: Math.floor(Date.now() / 1000),
+          model,
+          output: [],
+        },
+      });
+      enqueueEvent({
+        type: 'response.in_progress',
+        response: { id: responseId, status: 'in_progress' },
+      });
+
+      const run = async (): Promise<void> => {
+        const upstreamResponse = await proxyChatCompletions(
+          request,
+          {
+            model,
+            messages: [
+              ...(defaults.instructions
+                ? [{ role: 'system', content: defaults.instructions }]
+                : []),
+              ...normalizeTranscriptMessageToolNames(
+                transcript,
+                defaults.tools,
+              ),
+            ],
+            max_tokens: maxOutputTokens,
+            stream: true,
+            tools: translatedTools,
+            tool_choice: translateResponsesToolChoiceToChatWithTools(
+              defaults.tools,
+              defaults.tool_choice,
+            ),
+          },
+          proxyContext,
+          debugTrace,
+          '/v1/responses',
+          {
+            emitStreamEvents: true,
+            onCall: (invocation) => {
+              const outputIndex = allocateOutputIndex();
+              const id = `ws_${crypto.randomUUID().replaceAll('-', '')}`;
+              const item = {
+                completed: buildResponsesWebSearchCallItem(
+                  invocation,
+                  'completed',
+                  id,
+                ),
+                inProgress: buildResponsesWebSearchCallItem(
+                  invocation,
+                  'in_progress',
+                  id,
+                ),
+                outputIndex,
+              };
+              serverToolItems.push(item);
+              itemsByInvocationId.set(invocation.id, item);
+              enqueueEvent({
+                type: 'response.output_item.added',
+                item: item.inProgress,
+                output_index: outputIndex,
+                response_id: responseId,
+              });
+              enqueueEvent({
+                type: 'response.web_search_call.in_progress',
+                item_id: id,
+                output_index: outputIndex,
+              });
+              enqueueEvent({
+                type: 'response.web_search_call.searching',
+                item_id: id,
+                output_index: outputIndex,
+              });
+            },
+            onResult: (execution) => {
+              const item = itemsByInvocationId.get(execution.id)!;
+              const id = String(item.inProgress.id);
+              item.completed = buildResponsesWebSearchCallItem(
+                execution,
+                'completed',
+                id,
+              );
+              enqueueEvent({
+                type: 'response.web_search_call.completed',
+                item_id: id,
+                output_index: item.outputIndex,
+              });
+              enqueueEvent({
+                type: 'response.output_item.done',
+                item: item.completed,
+                output_index: item.outputIndex,
+                response_id: responseId,
+              });
+            },
+          },
+        );
+
+        if (cancelled) {
+          await upstreamResponse.body?.cancel();
+          return;
+        }
+
+        if (!upstreamResponse.ok || !upstreamResponse.body) {
+          enqueueEvent({
+            type: 'response.error',
+            error: { message: 'Upstream request failed' },
+          });
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+          return;
+        }
+
+        const mappedResponse = mapChatStreamToResponsesEventStream(
+          upstreamResponse,
+          defaults,
+          transcript,
+          model,
+          previousResponseId,
+          proxyContext,
+          responseId,
+          serverToolItems,
+          false,
+          false,
+          allocateOutputIndex,
+          true,
+        );
+        const reader = mappedResponse.body!.getReader();
+        activeReader = reader;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (cancelled) return;
+          if (done) break;
+          controller.enqueue(value);
+        }
+
+        reader.releaseLock();
+        activeReader = null;
+        controller.close();
+      };
+
+      void run().catch((error) => {
+        if (!cancelled) controller.error(error);
+      });
+    },
+    async cancel(reason): Promise<void> {
+      cancelled = true;
+      await activeReader?.cancel(reason);
+      activeReader?.releaseLock();
+      activeReader = null;
+    },
+  });
+
+  return new Response(stream, {
     headers: {
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
@@ -1872,6 +2344,7 @@ export const handleResponsesRequest = async (
       string,
       unknown
     >;
+    const serverToolExecutions = getServerToolExecutions(upstreamResponse);
 
     return Response.json(
       await mapChatResponseToResponsesPayload(
@@ -1882,6 +2355,7 @@ export const handleResponsesRequest = async (
         prepared.model,
         prepared.previousResponseId,
         upstreamPayload,
+        serverToolExecutions,
       ),
     );
   } catch (error) {

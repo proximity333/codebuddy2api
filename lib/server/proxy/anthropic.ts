@@ -1,9 +1,31 @@
 import type { NextRequest } from 'next/server';
 
-import { getDefaultModel } from '../domain/config';
+import {
+  getDefaultModel,
+  isWebFetchEnabled,
+  isWebSearchEnabled,
+} from '../domain/config';
 import type { DebugTrace } from '../domain/debug';
 
 import { proxyChatCompletions, type ChatRequestBody } from './codebuddy';
+import {
+  getServerToolStreamEvent,
+  getServerToolExecutions,
+  type ServerToolExecution,
+} from './web-search-loop';
+import {
+  anthropicStreamErrorChunks,
+  createStreamCloser,
+  toUpstreamTimeoutMessage,
+} from '../shared/upstream-timeout';
+import {
+  markServerTool,
+  normalizeToolName,
+  WEB_FETCH_TOOL_NAME,
+  WEB_FETCH_TOOL_TYPE_PREFIX,
+  WEB_SEARCH_TOOL_NAME,
+  WEB_SEARCH_TOOL_TYPE_PREFIX,
+} from '../search/tool';
 
 const MAX_STREAM_FRAME_LENGTH = 1_000_000;
 
@@ -222,6 +244,78 @@ interface ChatMessage {
   tool_call_id?: string;
 }
 
+const decodeOpaqueServerToolContent = (value: unknown): unknown => {
+  if (typeof value !== 'string' || !value) {
+    return null;
+  }
+
+  try {
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (character) =>
+      character.charCodeAt(0),
+    );
+
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    return null;
+  }
+};
+
+const formatAnthropicServerToolResult = (
+  block: AnthropicContentBlock,
+): string => {
+  if (block.type === 'web_search_tool_result' && Array.isArray(block.content)) {
+    return block.content
+      .map((value, index) => {
+        const item =
+          value && typeof value === 'object'
+            ? (value as Record<string, unknown>)
+            : {};
+        const decoded = decodeOpaqueServerToolContent(item.encrypted_content);
+        const source =
+          decoded && typeof decoded === 'object'
+            ? (decoded as Record<string, unknown>)
+            : item;
+        const title = String(source.title ?? item.title ?? '').trim();
+        const url = String(source.url ?? item.url ?? '').trim();
+        const text = String(
+          source.content ?? source.snippet ?? source.text ?? '',
+        ).trim();
+
+        return [
+          `${index + 1}. ${title || url || 'Search result'}`,
+          ...(url ? [`URL: ${url}`] : []),
+          ...(text ? [text] : []),
+        ].join('\n');
+      })
+      .join('\n\n');
+  }
+
+  if (
+    block.type === 'web_fetch_tool_result' &&
+    block.content &&
+    typeof block.content === 'object'
+  ) {
+    const result = block.content as Record<string, unknown>;
+    const document =
+      result.content && typeof result.content === 'object'
+        ? (result.content as Record<string, unknown>)
+        : null;
+    const source =
+      document?.source && typeof document.source === 'object'
+        ? (document.source as Record<string, unknown>)
+        : null;
+    const url = typeof result.url === 'string' ? result.url : '';
+    const text = typeof source?.data === 'string' ? source.data : '';
+
+    return [url, text].filter(Boolean).join('\n\n');
+  }
+
+  return typeof block.content === 'string'
+    ? block.content
+    : stringifyContent(block.content);
+};
+
 const mapAnthropicContentToChat = (
   content: string | AnthropicContentBlock[],
   role: 'user' | 'assistant',
@@ -230,10 +324,6 @@ const mapAnthropicContentToChat = (
     return [{ role, content }];
   }
 
-  // Collect text, structured tool calls, and tool results separately so
-  // the OpenAI upstream receives proper tool_calls / tool messages instead
-  // of flattened text. This preserves the call↔result relationship that
-  // multi-step tool loops rely on.
   const parts: Array<string | ChatTextBlock> = [];
   const toolCalls: Array<{
     id: string;
@@ -244,6 +334,22 @@ const mapAnthropicContentToChat = (
     };
   }> = [];
   const toolResults: ChatMessage[] = [];
+  const messages: ChatMessage[] = [];
+  const flushAssistantMessage = (): void => {
+    const textContent = mapTextPartsToChatContent(parts);
+
+    if (!toolCalls.length && !textContent.length) {
+      return;
+    }
+
+    messages.push({
+      role: 'assistant',
+      content: textContent.length ? textContent : null,
+      ...(toolCalls.length ? { tool_calls: [...toolCalls] } : {}),
+    });
+    parts.length = 0;
+    toolCalls.length = 0;
+  };
 
   for (const block of content) {
     if (block.type === 'text') {
@@ -254,7 +360,7 @@ const mapAnthropicContentToChat = (
           ? { type: 'text', text, cache_control: block.cache_control }
           : text,
       );
-    } else if (block.type === 'tool_use') {
+    } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {
       toolCalls.push({
         id: block.id ?? createAnthropicId('toolu'),
         type: 'function',
@@ -263,16 +369,23 @@ const mapAnthropicContentToChat = (
           arguments: JSON.stringify(block.input ?? {}),
         },
       });
-    } else if (block.type === 'tool_result') {
-      const resultContent =
-        typeof block.content === 'string'
-          ? block.content
-          : stringifyContent(block.content);
-      toolResults.push({
+    } else if (
+      block.type === 'tool_result' ||
+      block.type === 'web_search_tool_result' ||
+      block.type === 'web_fetch_tool_result'
+    ) {
+      const resultMessage: ChatMessage = {
         role: 'tool',
-        content: resultContent,
+        content: formatAnthropicServerToolResult(block),
         tool_call_id: block.tool_use_id ?? '',
-      });
+      };
+
+      if (role === 'assistant') {
+        flushAssistantMessage();
+        messages.push(resultMessage);
+      } else {
+        toolResults.push(resultMessage);
+      }
     } else if (block.type === 'thinking') {
       // Skip thinking blocks in conversation history for OpenAI compat.
     } else {
@@ -280,38 +393,14 @@ const mapAnthropicContentToChat = (
     }
   }
 
-  const textContent = mapTextPartsToChatContent(parts);
-  const messages: ChatMessage[] = [];
-
-  // Emit tool results before any free-form text so the tool result stays
-  // adjacent to the preceding assistant tool_calls in the OpenAI message
-  // history. Upstream APIs that validate tool-call adjacency can reject
-  // or ignore a tool result separated from its call by a user message.
   if (role === 'user') {
     messages.push(...toolResults);
-  }
-
-  // For an assistant message with tool calls, content can be null per the
-  // OpenAI spec. For user messages, keep text if present.
-  if (role === 'assistant') {
-    messages.push({
-      role: 'assistant',
-      content:
-        Array.isArray(textContent) && textContent.length === 0
-          ? null
-          : textContent || null,
-      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-    });
-  } else if (
-    Array.isArray(textContent) ? textContent.length > 0 : textContent
-  ) {
-    messages.push({ role: 'user', content: textContent });
-  }
-
-  // For assistant messages, tool results are not expected, but push any
-  // that slipped through after the assistant message.
-  if (role === 'assistant') {
-    messages.push(...toolResults);
+    const textContent = mapTextPartsToChatContent(parts);
+    if (textContent.length) {
+      messages.push({ role: 'user', content: textContent });
+    }
+  } else {
+    flushAssistantMessage();
   }
 
   return messages;
@@ -346,14 +435,41 @@ const mapAnthropicToolsToChat = (
     return undefined;
   }
 
-  return tools.map((tool) => ({
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.input_schema,
-    },
-  }));
+  return tools.map((tool) => {
+    const mapped = {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema,
+      },
+    };
+    const normalizedType = normalizeToolName(tool.type ?? '');
+    const serverDeclared = [
+      WEB_SEARCH_TOOL_TYPE_PREFIX,
+      WEB_FETCH_TOOL_TYPE_PREFIX,
+    ].some((prefix) => normalizedType.startsWith(normalizeToolName(prefix)));
+
+    return serverDeclared ? markServerTool(mapped) : mapped;
+  });
+};
+
+const shouldBridgeAnthropicServerTools = async (
+  tools: AnthropicTool[] | undefined,
+): Promise<boolean> => {
+  const names = new Set(
+    (tools ?? []).map((tool) => normalizeToolName(tool.name)),
+  );
+  const [searchEnabled, fetchEnabled] = await Promise.all([
+    names.has(normalizeToolName(WEB_SEARCH_TOOL_NAME))
+      ? isWebSearchEnabled()
+      : false,
+    names.has(normalizeToolName(WEB_FETCH_TOOL_NAME))
+      ? isWebFetchEnabled()
+      : false,
+  ]);
+
+  return searchEnabled || fetchEnabled;
 };
 
 const mapAnthropicToolChoiceToChat = (toolChoice: unknown): unknown => {
@@ -438,7 +554,8 @@ const buildChatRequestBody = async (
 
 const mapOpenAIUsageToAnthropic = (
   usage: OpenAIUsage | undefined,
-): Record<string, number> => {
+  serverToolExecutions: ServerToolExecution[] = [],
+): Record<string, unknown> => {
   const cacheCreationTokens =
     usage?.prompt_tokens_details?.cache_creation_tokens ?? 0;
   const cacheReadTokens = usage?.prompt_tokens_details?.cached_tokens ?? 0;
@@ -451,21 +568,92 @@ const mapOpenAIUsageToAnthropic = (
   );
   const outputTokens = usage?.completion_tokens ?? 0;
 
-  return {
+  const mapped: Record<string, number | Record<string, number>> = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     cache_creation_input_tokens: cacheCreationTokens,
     cache_read_input_tokens: cacheReadTokens,
   };
+
+  if (serverToolExecutions.length) {
+    mapped.server_tool_use = {
+      web_search_requests: serverToolExecutions.filter(
+        (execution) => execution.type === 'web_search',
+      ).length,
+      web_fetch_requests: serverToolExecutions.filter(
+        (execution) => execution.type === 'web_fetch',
+      ).length,
+    };
+  }
+
+  return mapped;
 };
+
+const encodeOpaqueServerToolContent = (value: unknown): string => {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = '';
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary);
+};
+
+const buildAnthropicServerToolBlocks = (
+  executions: ServerToolExecution[],
+): AnthropicContentBlock[] =>
+  executions.flatMap((execution) => {
+    const id = createAnthropicId('srvtoolu');
+    const result =
+      execution.type === 'web_search'
+        ? {
+            type: 'web_search_tool_result',
+            tool_use_id: id,
+            content: execution.result.results.map((item) => ({
+              type: 'web_search_result',
+              url: item.url ?? '',
+              title: item.title ?? '',
+              encrypted_content: encodeOpaqueServerToolContent(item),
+            })),
+          }
+        : {
+            type: 'web_fetch_tool_result',
+            tool_use_id: id,
+            content: {
+              type: 'web_fetch_result',
+              url: execution.result.url ?? execution.input.url,
+              content: {
+                type: 'document',
+                source: {
+                  type: 'text',
+                  media_type: 'text/plain',
+                  data: execution.result.content,
+                },
+              },
+            },
+          };
+
+    return [
+      {
+        type: 'server_tool_use',
+        id,
+        name: execution.type,
+        input: execution.input,
+      },
+      result,
+    ];
+  });
 
 const mapOpenAIResponseToAnthropic = (
   openaiResponse: OpenAIChatResponse,
   model: string,
+  serverToolExecutions: ServerToolExecution[] = [],
 ): Record<string, unknown> => {
   const choice = openaiResponse.choices?.[0];
   const message = choice?.message;
-  const contentBlocks: AnthropicContentBlock[] = [];
+  const contentBlocks: AnthropicContentBlock[] =
+    buildAnthropicServerToolBlocks(serverToolExecutions);
 
   // Thinking / reasoning content
   const reasoningText = message?.reasoning_content ?? message?.reasoning ?? '';
@@ -521,7 +709,10 @@ const mapOpenAIResponseToAnthropic = (
     content: contentBlocks,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: mapOpenAIUsageToAnthropic(openaiResponse.usage),
+    usage: mapOpenAIUsageToAnthropic(
+      openaiResponse.usage,
+      serverToolExecutions,
+    ),
   };
 };
 
@@ -560,6 +751,12 @@ interface StreamingToolUseState {
 const mapOpenAIStreamToAnthropicSSE = (
   upstreamResponse: Response,
   model: string,
+  options?: {
+    emitMessageStart?: boolean;
+    initialContentBlockCount?: number;
+    messageId?: string;
+    serverToolExecutions?: ServerToolExecution[];
+  },
 ): Response => {
   if (!upstreamResponse.body) {
     return new Response(null, {
@@ -575,10 +772,13 @@ const mapOpenAIStreamToAnthropicSSE = (
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
-  const messageId = createAnthropicId('msg');
+  const messageId = options?.messageId ?? createAnthropicId('msg');
+  const serverToolExecutions =
+    options?.serverToolExecutions ?? getServerToolExecutions(upstreamResponse);
+  const serverToolUseIds = new Map<string, string>();
   const toolUseStates = new Map<string, StreamingToolUseState>();
   let nextToolIndex = 0;
-  let started = false;
+  let started = options?.emitMessageStart === false;
   let thinkingStarted = false;
   let thinkingBlockIndex = -1;
   let textStarted = false;
@@ -586,7 +786,7 @@ const mapOpenAIStreamToAnthropicSSE = (
   // Tracks how many content blocks (thinking + text) have been opened
   // so tool_use blocks get correct sequential indices even after the
   // prior blocks are closed mid-stream.
-  let contentBlockCount = 0;
+  let contentBlockCount = options?.initialContentBlockCount ?? 0;
   let finishReason: string | null = null;
   let hasToolCalls = false;
   let usage: OpenAIUsage | undefined;
@@ -820,7 +1020,7 @@ const mapOpenAIStreamToAnthropicSSE = (
         stop_reason: stopReason,
         stop_sequence: null,
       },
-      usage: mapOpenAIUsageToAnthropic(usage),
+      usage: mapOpenAIUsageToAnthropic(usage, serverToolExecutions),
     });
 
     enqueueEvent({
@@ -831,6 +1031,7 @@ const mapOpenAIStreamToAnthropicSSE = (
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let cancelled = false;
   let streamRejected = false;
+  const closer = createStreamCloser();
   const releaseReader = (): void => {
     reader?.releaseLock();
     reader = null;
@@ -848,7 +1049,13 @@ const mapOpenAIStreamToAnthropicSSE = (
         enqueueEvent({
           type: 'error',
           error: {
-            type: 'invalid_request_error',
+            // An oversized frame is a malformed stream, but an upstream
+            // deadline is the server failing — and `api_error` is the type
+            // clients treat as retryable. Reporting a timeout as
+            // invalid_request_error would tell them never to retry.
+            type: message.includes('did not produce output')
+              ? 'api_error'
+              : 'invalid_request_error',
             message,
           },
         });
@@ -876,6 +1083,58 @@ const mapOpenAIStreamToAnthropicSSE = (
 
           try {
             const chunk = JSON.parse(raw) as OpenAIStreamChunk;
+            const serverToolEvent = getServerToolStreamEvent(chunk);
+
+            if (serverToolEvent?.phase === 'call') {
+              closeOpenTextBlocks();
+              const index = contentBlockCount++;
+              const toolUseId = createAnthropicId('srvtoolu');
+              serverToolUseIds.set(serverToolEvent.invocation.id, toolUseId);
+              enqueueEvent({
+                type: 'content_block_start',
+                index,
+                content_block: {
+                  type: 'server_tool_use',
+                  id: toolUseId,
+                  name: serverToolEvent.invocation.type,
+                  input: {},
+                },
+              });
+              enqueueEvent({
+                type: 'content_block_delta',
+                index,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: JSON.stringify(
+                    serverToolEvent.invocation.input,
+                  ),
+                },
+              });
+              enqueueEvent({ type: 'content_block_stop', index });
+              continue;
+            }
+
+            if (serverToolEvent?.phase === 'result') {
+              closeOpenTextBlocks();
+              serverToolExecutions.push(serverToolEvent.execution);
+              const index = contentBlockCount++;
+              const resultBlock = buildAnthropicServerToolBlocks([
+                serverToolEvent.execution,
+              ])[1];
+              enqueueEvent({
+                type: 'content_block_start',
+                index,
+                content_block: {
+                  ...resultBlock,
+                  tool_use_id: serverToolUseIds.get(
+                    serverToolEvent.execution.id,
+                  ),
+                },
+              });
+              enqueueEvent({ type: 'content_block_stop', index });
+              continue;
+            }
+
             const upstreamError = chunk as OpenAIStreamError;
             if (upstreamError.error?.message) {
               rejectStream(upstreamError.error.message);
@@ -928,10 +1187,27 @@ const mapOpenAIStreamToAnthropicSSE = (
         }
       };
 
-      void pump();
+      void pump().catch((error) => {
+        if (cancelled) return;
+        const timeoutMessage = toUpstreamTimeoutMessage(error);
+
+        if (timeoutMessage === null) {
+          closer.mark();
+          controller.error(error);
+          return;
+        }
+
+        void reader?.cancel().then(
+          () => undefined,
+          () => undefined,
+        );
+        releaseReader();
+        closer.fail(controller, anthropicStreamErrorChunks(timeoutMessage));
+      });
     },
     async cancel(reason): Promise<void> {
       cancelled = true;
+      closer.mark();
       try {
         await reader?.cancel(reason);
       } finally {
@@ -946,6 +1222,117 @@ const mapOpenAIStreamToAnthropicSSE = (
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
+    },
+  });
+};
+
+const createAnthropicServerToolEventStream = (
+  request: NextRequest,
+  chatBody: Record<string, unknown>,
+  model: string,
+  debugTrace?: DebugTrace,
+): Response => {
+  const encoder = new TextEncoder();
+  const messageId = createAnthropicId('msg');
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let cancelled = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start: (controller) => {
+      const enqueueEvent = (event: Record<string, unknown>): void => {
+        if (cancelled) return;
+        controller.enqueue(
+          encoder.encode(
+            `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+          ),
+        );
+      };
+
+      enqueueEvent({
+        type: 'message_start',
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+        },
+      });
+
+      const run = async (): Promise<void> => {
+        const upstreamResponse = await proxyChatCompletions(
+          request,
+          chatBody as ChatRequestBody,
+          undefined,
+          debugTrace,
+          '/v1/messages',
+          { emitStreamEvents: true },
+        );
+
+        if (cancelled) {
+          await upstreamResponse.body?.cancel();
+          return;
+        }
+
+        if (!upstreamResponse.ok || !upstreamResponse.body) {
+          enqueueEvent({
+            type: 'error',
+            error: { type: 'api_error', message: 'Upstream request failed' },
+          });
+          controller.close();
+          return;
+        }
+
+        const mappedResponse = mapOpenAIStreamToAnthropicSSE(
+          upstreamResponse,
+          model,
+          {
+            emitMessageStart: false,
+            initialContentBlockCount: 0,
+            messageId,
+            serverToolExecutions: [],
+          },
+        );
+        const reader = mappedResponse.body!.getReader();
+        activeReader = reader;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (cancelled) return;
+          if (done) break;
+          controller.enqueue(value);
+        }
+
+        reader.releaseLock();
+        activeReader = null;
+        controller.close();
+      };
+
+      void run().catch((error) => {
+        if (!cancelled) controller.error(error);
+      });
+    },
+    async cancel(reason): Promise<void> {
+      cancelled = true;
+      await activeReader?.cancel(reason);
+      activeReader?.releaseLock();
+      activeReader = null;
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'Content-Type': 'text/event-stream; charset=utf-8',
     },
   });
 };
@@ -997,6 +1384,16 @@ export const handleMessagesRequest = async (
 
   try {
     const chatBody = await buildChatRequestBody(body);
+
+    if (body.stream && (await shouldBridgeAnthropicServerTools(body.tools))) {
+      return createAnthropicServerToolEventStream(
+        request,
+        chatBody,
+        String(chatBody.model ?? 'unknown'),
+        debugTrace,
+      );
+    }
+
     const upstreamResponse = await proxyChatCompletions(
       request,
       chatBody as ChatRequestBody,
@@ -1013,6 +1410,7 @@ export const handleMessagesRequest = async (
     }
 
     const model = String(chatBody.model ?? 'unknown');
+    const serverToolExecutions = getServerToolExecutions(upstreamResponse);
 
     if (body.stream) {
       return mapOpenAIStreamToAnthropicSSE(upstreamResponse, model);
@@ -1020,7 +1418,9 @@ export const handleMessagesRequest = async (
 
     const payload = (await upstreamResponse.json()) as OpenAIChatResponse;
 
-    return Response.json(mapOpenAIResponseToAnthropic(payload, model));
+    return Response.json(
+      mapOpenAIResponseToAnthropic(payload, model, serverToolExecutions),
+    );
   } catch (error) {
     return createAnthropicError(
       500,
@@ -1029,7 +1429,10 @@ export const handleMessagesRequest = async (
   }
 };
 
-const createAnthropicError = (status: number, message: string): Response => {
+export const createAnthropicError = (
+  status: number,
+  message: string,
+): Response => {
   const type =
     status === 401
       ? 'authentication_error'

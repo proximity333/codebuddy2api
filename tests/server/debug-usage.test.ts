@@ -12,6 +12,7 @@ import {
   hasPendingDebugLogWrites,
   isDebugEnabled,
   listDebugLogs,
+  setDebugTraceCredential,
   setDebugTraceError,
   setDebugUpstreamRequest,
   updateDebugSettings,
@@ -902,5 +903,168 @@ describe('debug and usage persistence', () => {
         })
       ).tableRows,
     ).toEqual([]);
+  });
+
+  it('records a placeholder for streamed responses instead of cloning the body', async () => {
+    // Cloning a live SSE stream tees it and pins the buffered text for the
+    // whole life of the request, so the snapshot must skip the body.
+    const trace = createDebugTrace({
+      requestBody: { input: 'stream me' },
+      requestKey: null,
+      route: '/v1/responses',
+    });
+
+    const response = new Response(
+      'data: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+      {
+        headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
+      },
+    );
+
+    const returned = finalizeDebugTrace(trace, response);
+    // The original response must still be readable by the client.
+    expect(await returned.text()).toContain('response.output_text.delta');
+    await Promise.all(trace.pending);
+
+    expect(trace.transformedResponse).toMatchObject({
+      body: '[streaming response body omitted]',
+      status: 200,
+    });
+  });
+
+  it('waits for a stream to finish before persisting late proxy metadata', async () => {
+    const trace = createDebugTrace({
+      requestBody: { input: 'stream me' },
+      requestKey: null,
+      route: '/v1/messages',
+    });
+    const encoder = new TextEncoder();
+    let closeStream: (() => void) | undefined;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: first\n\n'));
+          closeStream = () => controller.close();
+        },
+      }),
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    );
+    const returned = finalizeDebugTrace(trace, response);
+    const reader = returned.body!.getReader();
+
+    await reader.read();
+    setDebugTraceCredential(trace, 'credential.json');
+    setDebugUpstreamRequest(trace, {
+      body: { model: 'hy4-dev' },
+      headers: { Authorization: 'Bearer secret-token' },
+      method: 'POST',
+      url: 'https://upstream.test/v2/chat/completions',
+    });
+    await enqueueUpstreamResponseSnapshot(
+      trace,
+      Response.json({ usage: { total_tokens: 12 } }),
+    ).text();
+
+    expect(await listDebugLogs()).toEqual([]);
+    closeStream!();
+    await reader.read();
+    await Promise.all(trace.pending);
+    await flushDebugLogs();
+
+    const [entry] = await listDebugLogs();
+    expect(entry).toMatchObject({
+      credentialFilename: 'credential.json',
+      upstreamRequest: {
+        body: { model: 'hy4-dev' },
+        headers: { Authorization: 'secr********' },
+      },
+      upstreamResponse: {
+        body: { usage: { total_tokens: 12 } },
+        status: 200,
+      },
+    });
+  });
+
+  it('persists an empty streaming response without waiting for a body', async () => {
+    const trace = createDebugTrace({
+      requestBody: { input: 'empty stream' },
+      requestKey: null,
+      route: '/v1/messages',
+    });
+    const response = new Response(null, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+
+    expect(finalizeDebugTrace(trace, response)).toBe(response);
+    await Promise.all(trace.pending);
+    await flushDebugLogs();
+
+    expect(await listDebugLogs()).toEqual([
+      expect.objectContaining({
+        transformedResponse: expect.objectContaining({
+          body: '[streaming response body omitted]',
+        }),
+      }),
+    ]);
+  });
+
+  it('still captures the body of non-streaming responses', async () => {
+    const trace = createDebugTrace({
+      requestBody: {},
+      requestKey: null,
+      route: '/v1/chat/completions',
+    });
+
+    const response = new Response(JSON.stringify({ ok: true }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    finalizeDebugTrace(trace, response);
+    await Promise.all(trace.pending);
+
+    expect(trace.transformedResponse?.body).toEqual({ ok: true });
+  });
+
+  it('caps sanitized array length and object key count', async () => {
+    const trace = createDebugTrace({
+      requestBody: {
+        manyKeys: Object.fromEntries(
+          Array.from({ length: 600 }, (_, index) => [`k${index}`, index]),
+        ),
+        manyItems: Array.from({ length: 600 }, (_, index) => index),
+      },
+      requestKey: null,
+      route: '/v1/responses',
+    });
+
+    const requestBody = trace.requestBody as {
+      manyItems: unknown[];
+      manyKeys: Record<string, unknown>;
+    };
+
+    // 500 kept + 1 truncation marker for arrays; objects are capped at 500 keys.
+    expect(requestBody.manyItems).toHaveLength(501);
+    expect(String(requestBody.manyItems.at(-1))).toContain(
+      'truncated 100 items',
+    );
+    expect(Object.keys(requestBody.manyKeys)).toHaveLength(500);
+  });
+
+  it('stops sanitizing once nesting is too deep', async () => {
+    let nested: Record<string, unknown> = { leaf: 'value' };
+
+    for (let depth = 0; depth < 20; depth += 1) {
+      nested = { child: nested };
+    }
+
+    const trace = createDebugTrace({
+      requestBody: nested,
+      requestKey: null,
+      route: '/v1/responses',
+    });
+
+    const json = JSON.stringify(trace.requestBody);
+
+    expect(json).toContain('nesting too deep');
   });
 });
