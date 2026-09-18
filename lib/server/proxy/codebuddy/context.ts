@@ -90,7 +90,10 @@ export const getApiEndpointForCredential = async (
     return 'https://www.codebuddy.ai';
   }
 
-  if (domain.endsWith('copilot.tencent.com') || domain.endsWith('codebuddy.cn')) {
+  if (
+    domain.endsWith('copilot.tencent.com') ||
+    domain.endsWith('codebuddy.cn')
+  ) {
     return 'https://copilot.tencent.com';
   }
 
