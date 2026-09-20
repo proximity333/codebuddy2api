@@ -783,7 +783,9 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 0,
+        inputTokens: 0,
         model: 'glm-4.7',
+        outputTokens: 0,
         totalTokens: 8,
       },
     ]);
@@ -826,7 +828,9 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 0,
+        inputTokens: 7,
         model: 'glm-5.1',
+        outputTokens: 3,
         totalTokens: 15,
       },
     ]);
@@ -1517,7 +1521,9 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 1,
+        inputTokens: 2,
         model: 'hy3',
+        outputTokens: 3,
         totalTokens: 5,
       },
     ]);
@@ -2458,7 +2464,9 @@ describe('server units', () => {
       {
         callCount: 2,
         cacheHitTokens: 0,
+        inputTokens: 7,
         model: 'hy3',
+        outputTokens: 5,
         totalTokens: 12,
       },
     ]);
@@ -2508,7 +2516,9 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 4,
+        inputTokens: 6,
         model: 'hy3',
+        outputTokens: 2,
         totalTokens: 8,
       },
     ]);
@@ -2759,7 +2769,9 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 0,
+        inputTokens: 4,
         model: 'hy3',
+        outputTokens: 3,
         totalTokens: 7,
       },
     ]);
@@ -2796,7 +2808,9 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 0,
+        inputTokens: 0,
         model: 'glm-5.1',
+        outputTokens: 0,
         totalTokens: 0,
       },
     ]);
@@ -3924,7 +3938,9 @@ describe('server units', () => {
         {
           callCount: 3,
           cacheHitTokens: 3,
+          inputTokens: 9,
           model: 'gpt-5.5',
+          outputTokens: 5,
           totalTokens: 14,
         },
       ]);
@@ -4096,13 +4112,17 @@ describe('server units', () => {
       {
         callCount: 1,
         cacheHitTokens: 0,
+        inputTokens: 5,
         model: 'gpt-5.5',
+        outputTokens: 6,
         totalTokens: 11,
       },
       {
         callCount: 1,
         cacheHitTokens: 0,
+        inputTokens: 4,
         model: 'glm-5.1',
+        outputTokens: 5,
         totalTokens: 9,
       },
     ]);
@@ -4195,7 +4215,9 @@ describe('server units', () => {
         {
           callCount: 1,
           cacheHitTokens: 0,
+          inputTokens: 1,
           model: 'gpt-5.5',
+          outputTokens: 2,
           totalTokens: 3,
         },
       ]);
@@ -5420,8 +5442,11 @@ describe('server units', () => {
     ]);
 
     expect(result).toHaveLength(7);
+    // A provider-executed declaration keeps its declared type: it is the only
+    // thing that tells it apart from the client's own function of the same
+    // name, and upstream never sees it because the turn rewrites it first.
     expect(result?.[0]).toMatchObject({
-      type: 'function',
+      type: 'web_search_preview',
       function: {
         name: 'web_search',
       },
@@ -5444,7 +5469,7 @@ describe('server units', () => {
       },
     });
     expect(result?.[3]).toMatchObject({
-      type: 'function',
+      type: 'web_search_preview',
       function: {
         name: 'web_search',
       },
@@ -5592,8 +5617,6 @@ describe('server units', () => {
       ]),
     ).toEqual([
       {
-        // Marked as server-declared so the proxy knows it executes the call.
-        'x-codebuddy2api-server-tool': true,
         type: 'function',
         function: expect.objectContaining({
           name: 'image_generation',
