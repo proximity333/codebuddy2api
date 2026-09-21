@@ -1,16 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/lib/server/domain/credentials', () => ({
+  getCredentialSupportedModelDetails: vi.fn(),
+  getCredentialSupportedModels: vi.fn(),
   listCredentials: vi.fn(),
   listEligibleCredentialRecords: vi.fn(),
+  updateCredentialSupportedModelCatalog: vi.fn(),
+  updateCredentialSupportedModelDetail: vi.fn(),
 }));
 vi.mock('@/lib/server/proxy/codebuddy', () => ({
   getApiEndpointForCredential: vi.fn(),
   getModelsForCredential: vi.fn(),
 }));
 
-const { listCredentials, listEligibleCredentialRecords } =
-  await import('@/lib/server/domain/credentials');
+const {
+  getCredentialSupportedModelDetails,
+  getCredentialSupportedModels,
+  listCredentials,
+  listEligibleCredentialRecords,
+  updateCredentialSupportedModelCatalog,
+  updateCredentialSupportedModelDetail,
+} = await import('@/lib/server/domain/credentials');
 const { getApiEndpointForCredential, getModelsForCredential } =
   await import('@/lib/server/proxy/codebuddy');
 const {
@@ -18,6 +28,7 @@ const {
   checkinAccounts,
   getAccountStatus,
   getAccountStatusCredentials,
+  resetCredentialModelDiscoveryFailures,
 } = await import('@/lib/server/domain/account-status');
 
 const credential = (filename: string) => ({
@@ -33,7 +44,12 @@ const jsonResponse = (payload: unknown, status = 200) =>
 
 describe('account status domain', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    // The discovery cooldown lives in module state, so a failure recorded by
+    // one case would silently skip discovery in the next.
+    resetCredentialModelDiscoveryFailures();
+    // restore, not just clear: a fetch spy left with an implementation leaks
+    // into the next case, and clearAllMocks only drops call records.
+    vi.restoreAllMocks();
     vi.mocked(getApiEndpointForCredential).mockResolvedValue(
       'https://codebuddy.example.test',
     );
@@ -41,9 +57,19 @@ describe('account status domain', () => {
       credential('one.json'),
     ] as never);
     vi.mocked(listCredentials).mockResolvedValue({ credentials: [] } as never);
+    vi.mocked(getCredentialSupportedModelDetails).mockReturnValue([]);
+    vi.mocked(getCredentialSupportedModels).mockReturnValue([]);
+    vi.mocked(updateCredentialSupportedModelCatalog).mockResolvedValue();
+    vi.mocked(updateCredentialSupportedModelDetail).mockResolvedValue();
     vi.mocked(getModelsForCredential).mockResolvedValue([
       { displayName: 'Model One', id: 'model-one' },
     ]);
+  });
+
+  // A spy restored after an assertion never runs when that assertion throws,
+  // which leaves console.warn mocked for everything that follows.
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('normalizes quota, check-in, and models', async () => {
@@ -59,10 +85,117 @@ describe('account status domain', () => {
     expect(result).toMatchObject({
       credits: { total: 1000, used: 250, remaining: 750, plan: 'Pro' },
       checkin: { claimed: true },
-      models: ['model-one'],
+      models: [{ displayName: 'Model One', id: 'model-one' }],
       error: null,
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses the cached model catalog instead of querying upstream', async () => {
+    const cached = [
+      {
+        credits: 'x3.33',
+        descriptionZh: '通用模型',
+        displayName: 'GLM 5.3',
+        id: 'glm-5.3',
+        isEnterprise: true,
+      },
+    ];
+    vi.mocked(getCredentialSupportedModelDetails).mockReturnValue(cached);
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        jsonResponse({ userQuota: { total: 1, used: 0, remaining: 1 } }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ status: 'CLAIMED' }));
+
+    const [result] = await getAccountStatus();
+
+    expect(result.models).toEqual(cached);
+    expect(getModelsForCredential).not.toHaveBeenCalled();
+  });
+
+  it('caches the catalog after a live model discovery', async () => {
+    const discovered = [
+      { credits: 'x1.5', displayName: 'Model One', id: 'model-one' },
+    ];
+    vi.mocked(getModelsForCredential).mockResolvedValue(discovered);
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ userQuota: { total: 1 } }))
+      .mockResolvedValueOnce(jsonResponse({ status: 'CLAIMED' }));
+
+    const [result] = await getAccountStatus();
+
+    // Spelled out rather than compared against the mock's own return value:
+    // the point is that discovery's models reach the caller unchanged.
+    expect(result.models).toEqual([
+      { credits: 'x1.5', displayName: 'Model One', id: 'model-one' },
+    ]);
+    expect(updateCredentialSupportedModelDetail).toHaveBeenCalledWith(
+      'one.json',
+      discovered,
+    );
+  });
+
+  it('keeps discovered models when the catalog cannot be cached', async () => {
+    vi.mocked(updateCredentialSupportedModelDetail).mockRejectedValue(
+      new Error('storage unavailable'),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ userQuota: { total: 1 } }))
+      .mockResolvedValueOnce(jsonResponse({ status: 'CLAIMED' }));
+
+    const [result] = await getAccountStatus();
+
+    expect(result.models).toEqual([
+      { displayName: 'Model One', id: 'model-one' },
+    ]);
+    expect(result.error).toBeNull();
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('falls back to saved model ids when discovery finds nothing', async () => {
+    vi.mocked(getCredentialSupportedModels).mockReturnValue(['glm-5.1']);
+    vi.mocked(getModelsForCredential).mockResolvedValue([]);
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ userQuota: { total: 1 } }))
+      .mockResolvedValueOnce(jsonResponse({ status: 'CLAIMED' }));
+
+    const [result] = await getAccountStatus();
+
+    expect(result.models).toEqual([{ displayName: 'glm-5.1', id: 'glm-5.1' }]);
+    expect(updateCredentialSupportedModelDetail).not.toHaveBeenCalled();
+  });
+
+  it('falls back to saved model ids when discovery fails', async () => {
+    vi.mocked(getCredentialSupportedModels).mockReturnValue(['glm-5.1']);
+    vi.mocked(getModelsForCredential).mockRejectedValue(
+      new Error('models unavailable'),
+    );
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ userQuota: { total: 1 } }))
+      .mockResolvedValueOnce(jsonResponse({ status: 'CLAIMED' }));
+
+    const [result] = await getAccountStatus();
+
+    expect(result.models).toEqual([{ displayName: 'glm-5.1', id: 'glm-5.1' }]);
+    // The saved ids still describe the account, so an unreachable upstream must
+    // not turn the whole card red.
+    expect(result.error).toBeNull();
+  });
+
+  it('reports a failed discovery when no saved ids can stand in', async () => {
+    vi.mocked(getModelsForCredential).mockRejectedValue(
+      new Error('models unavailable'),
+    );
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ userQuota: { total: 1 } }))
+      .mockResolvedValueOnce(jsonResponse({ status: 'CLAIMED' }));
+
+    const [result] = await getAccountStatus();
+
+    expect(result.models).toEqual([]);
+    expect(result.error).toContain('models unavailable');
   });
 
   it('records partial upstream errors', async () => {

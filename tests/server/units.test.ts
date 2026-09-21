@@ -62,7 +62,9 @@ import {
   getActiveConfig,
   getApiFirstDeltaTimeoutMs,
   getDefaultModel,
+  getFetchBackendSettings,
   getHyThoughtDepthEnabled,
+  getSearchBackendSettings,
   getSettingLabels,
   isHyModel,
   updateSettings,
@@ -4783,6 +4785,160 @@ describe('server units', () => {
     });
   });
 
+  it('carries the upstream model catalog metadata through discovery', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            agents: [
+              {
+                models: [
+                  'glm-5.3',
+                  'hy3-ioa',
+                  'sparse',
+                  'unknown-tag',
+                  'nulled',
+                ],
+                name: 'cli',
+              },
+            ],
+            models: [
+              {
+                contextWindow: { defaultLength: 200000 },
+                credits: 'x3.33',
+                descriptionEn: 'General purpose model',
+                descriptionZh: '通用模型',
+                id: 'glm-5.3',
+                maxInputTokens: 200000,
+                maxOutputTokens: 64000,
+                name: 'GLM 5.3',
+                supportsImages: true,
+                supportsReasoning: true,
+                supportsToolCall: true,
+                tags: ['craft', 'badge:企业版:#3B82F6'],
+                vendor: 'e',
+              },
+              {
+                credits: 'x0.00',
+                descriptionZh: '混元思考模型',
+                id: 'hy3-ioa',
+                name: 'Hy3',
+                supportsImages: false,
+                tags: ['badge:内部模型:#3B82F6', 'badge:free:#22C55E'],
+              },
+              { id: 'sparse', name: 'Sparse' },
+              { id: 'unknown-tag', name: 'Unknown', tags: [42, 'craft'] },
+              {
+                contextWindow: { defaultLength: 'not-a-number' },
+                id: 'ignored',
+                name: 'Ignored',
+              },
+              // A null field is upstream saying it does not know the value;
+              // it must not reach the card as a 0-token limit.
+              {
+                contextWindow: { defaultLength: null },
+                id: 'nulled',
+                maxOutputTokens: null,
+                name: 'Nulled',
+              },
+            ],
+          },
+        }),
+      ),
+    );
+
+    await expect(
+      getModelsForCredential({ bearerToken: 'token-a', credentialData: {} }),
+    ).resolves.toStrictEqual([
+      {
+        contextWindow: 200000,
+        credits: 'x3.33',
+        descriptionEn: 'General purpose model',
+        descriptionZh: '通用模型',
+        displayName: 'GLM 5.3',
+        id: 'glm-5.3',
+        isEnterprise: true,
+        isFree: undefined,
+        isInternal: undefined,
+        maxInputTokens: 200000,
+        maxOutputTokens: 64000,
+        supportsImages: true,
+        supportsReasoning: true,
+        supportsToolCall: true,
+        vendor: 'e',
+      },
+      {
+        contextWindow: undefined,
+        credits: 'x0.00',
+        descriptionEn: undefined,
+        descriptionZh: '混元思考模型',
+        displayName: 'Hy3',
+        id: 'hy3-ioa',
+        isEnterprise: undefined,
+        isFree: true,
+        isInternal: true,
+        maxInputTokens: undefined,
+        maxOutputTokens: undefined,
+        supportsImages: false,
+        supportsReasoning: undefined,
+        supportsToolCall: undefined,
+        vendor: undefined,
+      },
+      {
+        contextWindow: undefined,
+        credits: undefined,
+        descriptionEn: undefined,
+        descriptionZh: undefined,
+        displayName: 'Sparse',
+        id: 'sparse',
+        isEnterprise: undefined,
+        isFree: undefined,
+        isInternal: undefined,
+        maxInputTokens: undefined,
+        maxOutputTokens: undefined,
+        supportsImages: undefined,
+        supportsReasoning: undefined,
+        supportsToolCall: undefined,
+        vendor: undefined,
+      },
+      {
+        contextWindow: undefined,
+        credits: undefined,
+        descriptionEn: undefined,
+        descriptionZh: undefined,
+        displayName: 'Unknown',
+        id: 'unknown-tag',
+        isEnterprise: undefined,
+        isFree: undefined,
+        isInternal: undefined,
+        maxInputTokens: undefined,
+        maxOutputTokens: undefined,
+        supportsImages: undefined,
+        supportsReasoning: undefined,
+        supportsToolCall: undefined,
+        vendor: undefined,
+      },
+      {
+        contextWindow: undefined,
+        credits: undefined,
+        descriptionEn: undefined,
+        descriptionZh: undefined,
+        displayName: 'Nulled',
+        id: 'nulled',
+        isEnterprise: undefined,
+        isFree: undefined,
+        isInternal: undefined,
+        maxInputTokens: undefined,
+        maxOutputTokens: undefined,
+        supportsImages: undefined,
+        supportsReasoning: undefined,
+        supportsToolCall: undefined,
+        vendor: undefined,
+      },
+    ]);
+  });
+
   it('falls back to the enterprise model route when /v3/config is unavailable', async () => {
     const fetchMock = vi.spyOn(global, 'fetch');
     fetchMock
@@ -6089,6 +6245,190 @@ describe('server units', () => {
     expect(
       getSettingLabels('zh-CN').CODEBUDDY_API_TIMEOUT_MINUTES,
     ).toBeTruthy();
+  });
+
+  describe('server-tool backend settings', () => {
+    it('stores the configuration of a backend alongside its selection', async () => {
+      await updateSettings({
+        CODEBUDDY_WEB_SEARCH_BACKEND: 'searxng',
+        CODEBUDDY_SEARXNG_URL: 'http://searx.test:8080',
+        CODEBUDDY_SEARXNG_API_KEY: 'searx-key',
+      });
+
+      await expect(getActiveConfig()).resolves.toMatchObject({
+        CODEBUDDY_SEARXNG_API_KEY: 'searx-key',
+        CODEBUDDY_SEARXNG_URL: 'http://searx.test:8080',
+        CODEBUDDY_WEB_SEARCH_BACKEND: 'searxng',
+      });
+    });
+
+    it('defaults the fetch selection to the local backend', async () => {
+      await updateSettings({ CODEBUDDY_WEB_FETCH_BACKEND: '' });
+
+      await expect(getActiveConfig()).resolves.toMatchObject({
+        CODEBUDDY_WEB_FETCH_BACKEND: 'codebuddy2api',
+      });
+    });
+
+    it('hands each backend only the settings it needs', async () => {
+      await updateSettings({
+        CODEBUDDY_BRAVE_API_KEY: 'brave-key',
+        CODEBUDDY_BROWSERABLE_URL: 'http://browser.test',
+        CODEBUDDY_DUCKDUCKGO_REGION: 'cn-zh',
+        CODEBUDDY_JINA_API_KEY: 'jina-key',
+      });
+
+      const config = await getActiveConfig();
+
+      expect(getSearchBackendSettings(config)).toEqual({
+        bingApiKey: '',
+        braveApiKey: 'brave-key',
+        duckduckgoRegion: 'cn-zh',
+        exaApiKey: '',
+        searxngApiKey: '',
+        searxngUrl: '',
+        serperApiKey: '',
+        tavilyApiKey: '',
+      });
+      expect(getFetchBackendSettings(config)).toEqual({
+        browserableApiKey: '',
+        browserableUrl: 'http://browser.test',
+        jinaApiKey: 'jina-key',
+      });
+    });
+
+    it('labels every backend setting in every supported locale', () => {
+      const keys = [
+        'CODEBUDDY_WEB_SEARCH_BACKEND',
+        'CODEBUDDY_WEB_FETCH_BACKEND',
+        'CODEBUDDY_SEARXNG_URL',
+        'CODEBUDDY_SEARXNG_API_KEY',
+        'CODEBUDDY_DUCKDUCKGO_REGION',
+        'CODEBUDDY_BRAVE_API_KEY',
+        'CODEBUDDY_TAVILY_API_KEY',
+        'CODEBUDDY_SERPER_API_KEY',
+        'CODEBUDDY_BING_API_KEY',
+        'CODEBUDDY_EXA_API_KEY',
+        'CODEBUDDY_BROWSERABLE_URL',
+        'CODEBUDDY_BROWSERABLE_API_KEY',
+        'CODEBUDDY_JINA_API_KEY',
+      ] as const;
+
+      for (const locale of ['en-US', 'ja-JP', 'zh-CN'] as const) {
+        const labels = getSettingLabels(locale);
+
+        for (const key of keys) {
+          expect(labels[key]).toBeTruthy();
+        }
+      }
+    });
+
+    it('reads a backend setting from the environment before anything is saved', async () => {
+      process.env.CODEBUDDY_BRAVE_API_KEY = 'from-env';
+
+      try {
+        await expect(getActiveConfig()).resolves.toMatchObject({
+          CODEBUDDY_BRAVE_API_KEY: 'from-env',
+        });
+      } finally {
+        delete process.env.CODEBUDDY_BRAVE_API_KEY;
+      }
+    });
+  });
+
+  it('reads only real token limits from the upstream catalog', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            agents: [
+              {
+                models: ['n-bool', 'n-arr', 'n-neg', 'n-str', 'n-zero'],
+                name: 'cli',
+              },
+            ],
+            models: [
+              {
+                id: 'n-bool',
+                maxInputTokens: true,
+                maxOutputTokens: false,
+                name: 'B',
+              },
+              { contextWindow: { defaultLength: [] }, id: 'n-arr', name: 'A' },
+              { id: 'n-neg', maxOutputTokens: -1, name: 'N' },
+              {
+                contextWindow: { defaultLength: '  500  ' },
+                id: 'n-str',
+                name: 'S',
+              },
+              { id: 'n-zero', maxOutputTokens: 0, name: 'Z' },
+            ],
+          },
+        }),
+      ),
+    );
+
+    // `Number(true)` is 1 and `Number([])` is 0, so a boolean or an object is
+    // not a limit at all; nor is a zero or a negative one. Reporting any of
+    // them would invent a window the catalog does not claim.
+    await expect(
+      getModelsForCredential({ bearerToken: 'token-a', credentialData: {} }),
+    ).resolves.toEqual([
+      { displayName: 'B', id: 'n-bool' },
+      { displayName: 'A', id: 'n-arr' },
+      { displayName: 'N', id: 'n-neg' },
+      { contextWindow: 500, displayName: 'S', id: 'n-str' },
+      { displayName: 'Z', id: 'n-zero' },
+    ]);
+  });
+
+  it('reads a badge whatever the tag case or label shape', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            agents: [
+              {
+                models: ['mixed-case', 'with-colour', 'no-colour', 'bare'],
+                name: 'cli',
+              },
+            ],
+            models: [
+              {
+                id: 'mixed-case',
+                name: 'Mixed',
+                tags: ['Badge:Free:#0f0', 'BADGE:企业版:#00f'],
+              },
+              {
+                id: 'with-colour',
+                name: 'With',
+                tags: ['badge:免费:#0f0', 'craft'],
+              },
+              { id: 'no-colour', name: 'Plain', tags: ['badge:免费'] },
+              { id: 'bare', name: 'Bare', tags: ['badge:', 42] },
+            ],
+          },
+        }),
+      ),
+    );
+
+    // The tag prefix is case-insensitive, and a label may itself contain the
+    // separator: the colour is always the trailing segment.
+    await expect(
+      getModelsForCredential({ bearerToken: 'token-a', credentialData: {} }),
+    ).resolves.toEqual([
+      {
+        displayName: 'Mixed',
+        id: 'mixed-case',
+        isEnterprise: true,
+        isFree: true,
+      },
+      { displayName: 'With', id: 'with-colour', isFree: true },
+      { displayName: 'Plain', id: 'no-colour', isFree: true },
+      { displayName: 'Bare', id: 'bare' },
+    ]);
   });
 
   describe('API timeout enforcement', () => {
