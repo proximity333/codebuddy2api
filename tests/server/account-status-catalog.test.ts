@@ -16,6 +16,7 @@ const {
   getCredentialSupportedModelDetails,
   getCredentialSupportedModels,
   resetCredentialRuntimeState,
+  updateCredentialSupportedModelDetail,
 } = await import('@/lib/server/domain/credentials');
 const {
   getAccountStatus,
@@ -168,6 +169,285 @@ describe('account status model catalog caching', () => {
       { displayName: 'saved-a', id: 'saved-a' },
     ]);
     expect(getModelsForCredential).toHaveBeenCalledTimes(1);
+  });
+
+  it('trims a catalog too large to cache instead of writing it whole', async () => {
+    const filename = await addAccount({}, 'huge');
+
+    await updateCredentialSupportedModelDetail(
+      filename,
+      Array.from({ length: 1500 }, (_, index) => ({
+        credits: 'x3.33',
+        descriptionZh: '描述'.repeat(80),
+        displayName: `Model ${index}`,
+        id: `model-${index}`,
+        relatedModels: { lite: `model-${index}-lite` },
+        vendor: 'e',
+      })),
+    );
+
+    const stored = await findCredentialRecordByFilename(filename);
+    const raw = stored?.data?.supported_models_detail;
+
+    // The credential namespace is encrypted whole on every write, so a catalog
+    // is trimmed rather than cached unbounded.
+    expect(typeof raw).toBe('string');
+    expect((raw ?? '').length).toBeLessThanOrEqual(256 * 1024);
+
+    const details = getCredentialSupportedModelDetails(stored?.data);
+
+    expect(details.length).toBeGreaterThan(0);
+    // What survives still routes and still renders; the bulk that went is the
+    // descriptions and the per-model extras.
+    expect(details[0]?.id).toBe('model-0');
+    expect(details[0]?.vendor).toBe('e');
+    expect(details[0]?.descriptionZh).toBeUndefined();
+    expect(details[0]?.relatedModels).toBeUndefined();
+  });
+
+  it('sheds a campaign before it sheds models, and drops one it cannot trim', async () => {
+    const build = (count: number, withPromotion: boolean) =>
+      Array.from({ length: count }, (_, index) => ({
+        descriptionZh: '描述'.repeat(80),
+        displayName: `Model ${index}`,
+        id: `model-${index}`,
+        ...(withPromotion
+          ? {
+              promotion: {
+                label: '限时免费',
+                textZh: '说明'.repeat(80),
+              },
+            }
+          : {}),
+      }));
+
+    const promoted = await addAccount({}, 'promoted-huge');
+
+    await updateCredentialSupportedModelDetail(promoted, build(1500, true));
+
+    // The promotion copy is the first thing to go.
+    expect(
+      getCredentialSupportedModelDetails(
+        (await findCredentialRecordByFilename(promoted))?.data,
+      )[0]?.promotion?.textZh,
+    ).toBeUndefined();
+
+    const enormous = await addAccount({}, 'enormous');
+
+    // One model that cannot be trimmed: an id far longer than the budget.
+    await updateCredentialSupportedModelDetail(enormous, [
+      { displayName: 'Huge', id: 'i'.repeat(400_000) },
+    ]);
+
+    // Better no cache than a credential document written whole on every save.
+    expect(
+      (await findCredentialRecordByFilename(enormous))?.data
+        ?.supported_models_detail,
+    ).toBeUndefined();
+  });
+
+  it('reads the cache again on refresh instead of going back upstream', async () => {
+    const filename = await addAccount({}, 'cached-twice');
+
+    await getAccountStatus([filename]);
+    const [second] = await getAccountStatus([filename]);
+
+    expect(second?.models).toEqual([
+      { displayName: 'Upstream One', id: 'upstream-1' },
+    ]);
+    expect(getModelsForCredential).toHaveBeenCalledTimes(1);
+  });
+
+  it('goes back upstream on refresh and replaces the cached catalog', async () => {
+    const filename = await addAccount({}, 'refreshing');
+
+    await getAccountStatus([filename]);
+
+    vi.mocked(getModelsForCredential).mockResolvedValue([
+      { displayName: 'Upstream Two', id: 'upstream-2', vendor: 'e' },
+    ]);
+
+    const [refreshed] = await getAccountStatus([filename], { refresh: true });
+
+    expect(getModelsForCredential).toHaveBeenCalledTimes(2);
+    expect(refreshed?.models).toEqual([
+      { displayName: 'Upstream Two', id: 'upstream-2', vendor: 'e' },
+    ]);
+
+    const stored = await findCredentialRecordByFilename(filename);
+
+    // Replaced, not merged: a model upstream dropped is gone from the card.
+    expect(getCredentialSupportedModelDetails(stored?.data)).toMatchObject([
+      { id: 'upstream-2' },
+    ]);
+  });
+
+  it('keeps the cached catalog when a refresh comes back empty', async () => {
+    const filename = await addAccount({}, 'empty-refresh');
+
+    await getAccountStatus([filename]);
+
+    vi.mocked(getModelsForCredential).mockResolvedValue([]);
+
+    const [refreshed] = await getAccountStatus([filename], { refresh: true });
+
+    // The point of a refresh is to update the cache, not to empty it.
+    expect(refreshed?.models).toEqual([
+      { displayName: 'Upstream One', id: 'upstream-1' },
+    ]);
+  });
+
+  it('keeps the cached catalog when a refresh fails', async () => {
+    const filename = await addAccount({}, 'failing-refresh');
+
+    await getAccountStatus([filename]);
+
+    vi.mocked(getModelsForCredential).mockRejectedValue(
+      new Error('upstream unreachable'),
+    );
+
+    const [refreshed] = await getAccountStatus([filename], { refresh: true });
+
+    expect(refreshed?.models).toEqual([
+      { displayName: 'Upstream One', id: 'upstream-1' },
+    ]);
+    expect(refreshed?.error).toBeNull();
+  });
+
+  it('lets a refresh retry a discovery that is still cooling down', async () => {
+    const filename = await addAccount({}, 'cooldown-refresh');
+
+    vi.mocked(getModelsForCredential).mockRejectedValueOnce(
+      new Error('upstream unreachable'),
+    );
+
+    await getAccountStatus([filename]);
+
+    // A page view would hold off for the rest of the cooldown; the operator
+    // pressing Refresh is asking for the call anyway.
+    vi.mocked(getModelsForCredential).mockResolvedValue([
+      { displayName: 'Recovered', id: 'recovered' },
+    ]);
+
+    const [refreshed] = await getAccountStatus([filename], { refresh: true });
+
+    expect(refreshed?.models).toEqual([
+      { displayName: 'Recovered', id: 'recovered' },
+    ]);
+  });
+
+  it('keeps the cached catalog when a refresh has no token to send', async () => {
+    const filename = await addAccount({}, 'blank-refresh');
+
+    await getAccountStatus([filename]);
+
+    // The token is gone but the catalog is not: a refresh must not drop the
+    // metadata a page load would still show.
+    await addCredential(
+      { bearer_token: '   ', user_id: 'blank@example.com' },
+      filename,
+    );
+
+    const stored = await findCredentialRecordByFilename(filename);
+
+    expect(String(stored?.data?.bearer_token ?? '').trim()).toBe('');
+
+    const [refreshed] = await getAccountStatus([filename], { refresh: true });
+
+    expect(getModelsForCredential).toHaveBeenCalledTimes(1);
+    expect(refreshed?.models).toEqual([
+      { displayName: 'Upstream One', id: 'upstream-1' },
+    ]);
+  });
+
+  it('leaves the routing whitelist alone on refresh', async () => {
+    const filename = await addAccount(
+      { supported_models: 'curated-a,curated-b' },
+      'curated-refresh',
+    );
+
+    await getAccountStatus([filename], { refresh: true });
+
+    const stored = await findCredentialRecordByFilename(filename);
+
+    expect(getCredentialSupportedModels(stored?.data)).toEqual([
+      'curated-a',
+      'curated-b',
+    ]);
+  });
+
+  it('halves a catalog whose lean form is still too large', async () => {
+    const filename = await addAccount({}, 'unboundedly-huge');
+
+    // Descriptions and extras are not what makes this one oversized: even
+    // stripped down it does not fit, so the guard has to drop models.
+    await updateCredentialSupportedModelDetail(
+      filename,
+      Array.from({ length: 6000 }, (_, index) => ({
+        descriptionZh: '描述'.repeat(40),
+        displayName: `Model ${index}`,
+        id: `model-${index}`.padEnd(60, '0'),
+      })),
+    );
+
+    const stored = await findCredentialRecordByFilename(filename);
+    const raw = stored?.data?.supported_models_detail;
+
+    expect(typeof raw).toBe('string');
+    expect((raw ?? '').length).toBeLessThanOrEqual(256 * 1024);
+
+    const details = getCredentialSupportedModelDetails(stored?.data);
+
+    expect(details.length).toBeGreaterThan(0);
+    expect(details.length).toBeLessThan(6000);
+    // The head of the catalog is what the card renders first, so it is what
+    // survives the cut.
+    expect(details[0]?.id.startsWith('model-0')).toBe(true);
+  });
+
+  it('withholds a cached campaign until its window opens', async () => {
+    const filename = await addAccount(
+      {
+        supported_models: 'scheduled',
+        supported_models_detail: JSON.stringify([
+          {
+            displayName: 'Scheduled',
+            id: 'scheduled',
+            promotion: {
+              endsAt: '2099-02-01T00:00:00.000Z',
+              label: '限时免费',
+              startsAt: '2099-01-01T00:00:00.000Z',
+            },
+          },
+        ]),
+      },
+      'scheduled',
+    );
+
+    vi.useFakeTimers();
+
+    try {
+      vi.setSystemTime(new Date('2026-09-21T00:00:00.000Z'));
+
+      const [before] = await getAccountStatus([filename]);
+
+      // Still in the cache — just not running yet.
+      expect(before?.models[0]?.promotion).toBeUndefined();
+
+      vi.setSystemTime(new Date('2099-01-02T00:00:00.000Z'));
+
+      const [during] = await getAccountStatus([filename]);
+
+      expect(during?.models[0]?.promotion?.label).toBe('限时免费');
+
+      vi.setSystemTime(new Date('2099-02-02T00:00:00.000Z'));
+
+      const [after] = await getAccountStatus([filename]);
+
+      expect(after?.models[0]?.promotion).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('never asks upstream for a credential holding a blank token', async () => {
